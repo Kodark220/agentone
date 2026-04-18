@@ -98,18 +98,19 @@ export function createRouter(
   router.get('/wallets', (_req: Request, res: Response) => {
     res.json({
       wallets: walletTracker.getTrackedWallets(),
+      walletDetails: walletTracker.getWalletDetails(),
       recentActivity: walletTracker.getRecentActivities(),
     });
   });
 
   router.post('/wallets', (req: Request, res: Response) => {
-    const { address } = req.body;
+    const { address, label } = req.body;
     if (!address || typeof address !== 'string' || address.length < 32) {
       res.status(400).json({ error: 'Valid Solana address required' });
       return;
     }
-    walletTracker.addWallet(address);
-    res.json({ ok: true, wallets: walletTracker.getTrackedWallets() });
+    walletTracker.addWallet(address, label);
+    res.json({ ok: true, wallets: walletTracker.getTrackedWallets(), walletDetails: walletTracker.getWalletDetails() });
   });
 
   router.delete('/wallets/:address', (req: Request, res: Response) => {
@@ -120,6 +121,11 @@ export function createRouter(
   router.get('/wallets/scan', async (_req: Request, res: Response) => {
     const signals = await walletTracker.detectAccumulationSignals();
     res.json({ signals });
+  });
+
+  router.post('/wallets/discover', async (_req: Request, res: Response) => {
+    const discovered = await walletTracker.autoDiscoverWhales();
+    res.json({ discovered, walletDetails: walletTracker.getWalletDetails() });
   });
 
   // ---- Positions ----
@@ -173,6 +179,15 @@ export function createRouter(
     res.json({ setups });
   });
 
+  router.get('/futures/setups/:id', (req: Request, res: Response) => {
+    const setup = perpsTrader.getFuturesSetupById(req.params.id as string);
+    if (!setup) {
+      res.status(404).json({ error: 'Setup not found' });
+      return;
+    }
+    res.json({ setup });
+  });
+
   router.post('/futures/generate', async (_req: Request, res: Response) => {
     try {
       const setups = await perpsTrader.scanFuturesMarkets();
@@ -219,6 +234,16 @@ export function createRouter(
       return;
     }
     res.json({ ok: true, token });
+  });
+
+  router.get('/trenches/:address', (req: Request, res: Response) => {
+    const tokens = solTrenches.getTrackedTokens();
+    const token = tokens.find((t: any) => t.address === req.params.address);
+    if (!token) {
+      res.status(404).json({ error: 'Token not tracked' });
+      return;
+    }
+    res.json({ token });
   });
 
   router.delete('/trenches/:address', (req: Request, res: Response) => {

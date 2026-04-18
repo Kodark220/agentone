@@ -589,6 +589,48 @@ export class PerpsTrader {
       logger.debug(`[FUTURES] CoinGecko markets fetch failed: ${err.message}`);
     }
 
+    // Under-the-radar: low-cap gainers from CoinGecko (sorted by 24h gain, lower mcap)
+    try {
+      const resp = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
+        params: { vs_currency: 'usd', order: 'percent_change_24h_desc', per_page: 50, page: 1, sparkline: false, price_change_percentage: '24h,7d' },
+        timeout: 10000,
+      });
+      const gainers = resp.data || [];
+      for (const coin of gainers) {
+        const sym = coin.symbol?.toUpperCase();
+        if (sym && !symbols.includes(sym)) symbols.push(sym);
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] CoinGecko gainers fetch failed: ${err.message}`);
+    }
+
+    // Recently added / new listings from CoinGecko
+    try {
+      const resp = await axios.get('https://api.coingecko.com/api/v3/coins/list/new', { timeout: 10000 });
+      const newCoins = resp.data || [];
+      for (const coin of newCoins.slice(0, 20)) {
+        const sym = coin.symbol?.toUpperCase();
+        if (sym && !symbols.includes(sym)) symbols.push(sym);
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] CoinGecko new coins fetch failed: ${err.message}`);
+    }
+
+    // Gate.io recently listed futures (high volume newcomers)
+    try {
+      const resp = await axios.get('https://api.gateio.ws/api/v4/futures/usdt/contracts', { timeout: 10000 });
+      const contracts = (resp.data || [])
+        .filter((c: any) => c.name?.endsWith('_USDT'))
+        .sort((a: any, b: any) => Number(b.create_time || 0) - Number(a.create_time || 0))
+        .slice(0, 30);
+      for (const c of contracts) {
+        const sym = c.name?.replace('_USDT', '');
+        if (sym && !symbols.includes(sym)) symbols.push(sym);
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] Gate.io new listings fetch failed: ${err.message}`);
+    }
+
     if (symbols.length > 0) {
       this.cmcCache = { symbols, ts: Date.now() };
     }
@@ -806,7 +848,7 @@ export class PerpsTrader {
 
     logger.info(`[FUTURES] Scanning ${symbols.length} exchange perps markets (incl. trending)...`);
 
-    for (const symbol of symbols.slice(0, 50)) {
+    for (const symbol of symbols.slice(0, 70)) {
       try {
         // Fetch OHLCV — from connected exchange or Gate.io/CryptoCompare
         let candles: number[][];
@@ -1055,6 +1097,11 @@ export class PerpsTrader {
 
   getFuturesSetups(): FuturesSetup[] {
     return this.futuresSetups;
+  }
+
+  // ---- Get detailed data for a single futures setup ----
+  getFuturesSetupById(id: string): FuturesSetup | undefined {
+    return this.futuresSetups.find(s => s.id === id);
   }
 }
 

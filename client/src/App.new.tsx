@@ -53,6 +53,10 @@ export default function App() {
   const [flowSummary, setFlowSummary] = useState<any>(null);
   const [expandedSetup, setExpandedSetup] = useState<string | null>(null);
 
+  // Detail modal state
+  const [detailModal, setDetailModal] = useState<{ type: 'futures' | 'trench'; data: any } | null>(null);
+  const [walletDetails, setWalletDetails] = useState<any[]>([]);
+
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [newWallet, setNewWallet] = useState('');
@@ -73,6 +77,7 @@ export default function App() {
       setPositions(pos.open || []);
       setWatchlist(wl.watchlist || []);
       setWallets(wal.wallets || []);
+      setWalletDetails(wal.walletDetails || []);
       setWalletActivity(wal.recentActivity || []);
       setNews(n.news || []);
       setAutoTrade(s.autoTrade || false);
@@ -329,7 +334,7 @@ export default function App() {
                         {futuresSetups.map((s: any, i: number) => (
                           <motion.div key={s.id || i} variants={cardSpring} layout>
                             <Card className="bg-secondary/30 border-border/40 hover:border-blue-500/30 transition-colors cursor-pointer"
-                              onClick={() => setExpandedSetup(expandedSetup === s.id ? null : s.id)}>
+                              onClick={() => setDetailModal({ type: 'futures', data: s })}>
                               <CardContent className="p-4 space-y-3">
                                 {/* Header */}
                                 <div className="flex items-center justify-between">
@@ -539,7 +544,8 @@ export default function App() {
                       </div>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                         {pumpCandidates.slice(0, 6).map((t: any, i: number) => (
-                          <div key={t.address || i} className="flex items-center justify-between bg-background/40 rounded-md p-2">
+                          <div key={t.address || i} className="flex items-center justify-between bg-background/40 rounded-md p-2 cursor-pointer hover:bg-background/60 transition-colors"
+                            onClick={() => setDetailModal({ type: 'trench', data: t })}>
                             <div className="flex items-center gap-2">
                               <span className="font-bold text-xs">{t.symbol}</span>
                               <Badge variant={t.ageLabel === 'NEW' ? 'success' : t.ageLabel === 'RECENT' ? 'warning' : 'info'} className="text-[9px] px-1 py-0">{t.ageLabel}</Badge>
@@ -612,7 +618,9 @@ export default function App() {
                         <tbody>
                           <AnimatePresence>
                             {filteredTrench.slice(0, 30).map((t: any, i: number) => (
-                              <motion.tr key={t.address || i} variants={fadeInUp} initial="initial" animate="animate" exit="exit" layout>
+                              <motion.tr key={t.address || i} variants={fadeInUp} initial="initial" animate="animate" exit="exit" layout
+                                className="cursor-pointer hover:bg-secondary/30 transition-colors"
+                                onClick={() => setDetailModal({ type: 'trench', data: t })}>
                                 <td>
                                   <div className="flex items-center gap-1.5">
                                     <span className="font-semibold">{t.symbol}</span>
@@ -656,7 +664,7 @@ export default function App() {
                                   </span>
                                 </td>
                                 <td>
-                                  <Button variant="ghost" size="xs" onClick={() => { api.removeTrenchToken(t.address); refresh(); }}
+                                  <Button variant="ghost" size="xs" onClick={(e) => { e.stopPropagation(); api.removeTrenchToken(t.address); refresh(); }}
                                     className="text-red-400 hover:text-red-300 hover:bg-red-500/10">
                                     <X className="w-3 h-3" />
                                   </Button>
@@ -897,7 +905,22 @@ export default function App() {
                   />
                   <Button variant="success" size="sm" onClick={handleAddWallet}>Track</Button>
                 </div>
-                {wallets.length > 0 && (
+                {walletDetails.length > 0 && (
+                  <div className="space-y-1">
+                    {walletDetails.map((w: any) => (
+                      <div key={w.address} className="flex items-center justify-between py-1.5 px-2 rounded-md hover:bg-secondary/40 text-xs">
+                        <div className="flex items-center gap-2">
+                          <code className="text-muted-foreground">{w.address.slice(0, 8)}...{w.address.slice(-6)}</code>
+                          {w.label && <Badge variant="info" className="text-[9px] px-1.5 py-0">{w.label}</Badge>}
+                          {w.isAutoTracked && <Badge variant="secondary" className="text-[9px] px-1 py-0">AUTO</Badge>}
+                        </div>
+                        <Button variant="ghost" size="xs" onClick={() => { api.removeWallet(w.address); refresh(); }}
+                          className="text-red-400 hover:text-red-300 hover:bg-red-500/10"><X className="w-3 h-3" /></Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {walletDetails.length === 0 && wallets.length > 0 && (
                   <div className="space-y-1">
                     {wallets.map((w: string) => (
                       <div key={w} className="flex items-center justify-between py-1.5 px-2 rounded-md hover:bg-secondary/40 text-xs">
@@ -994,6 +1017,362 @@ export default function App() {
           </Card>
         </motion.div>
       </main>
+
+      {/* ---- TOKEN DETAIL MODAL ---- */}
+      <AnimatePresence>
+        {detailModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+            onClick={() => setDetailModal(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.92, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 10 }}
+              transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+              className="w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl border border-border bg-card shadow-2xl"
+              onClick={e => e.stopPropagation()}
+            >
+              {detailModal.type === 'futures' && (() => {
+                const s = detailModal.data;
+                return (
+                  <div className="p-6 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <h2 className="text-xl font-bold">{s.pair || s.symbol}</h2>
+                        <Badge variant={s.direction === 'LONG' ? 'long' : 'short'} className="text-xs">
+                          {s.direction === 'LONG' ? <TrendingUp className="w-3.5 h-3.5 mr-1" /> : <TrendingDown className="w-3.5 h-3.5 mr-1" />}
+                          {s.direction}
+                        </Badge>
+                        <span className={cn('text-lg font-bold tabular-nums', confColor(s.confidence))}>{s.confidence?.toFixed(0)}%</span>
+                      </div>
+                      <Button variant="ghost" size="sm" onClick={() => setDetailModal(null)}>
+                        <X className="w-4 h-4" />
+                      </Button>
+                    </div>
+
+                    {/* Price Levels */}
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="rounded-lg bg-blue-500/10 border border-blue-500/20 p-3 text-center">
+                        <span className="text-[10px] uppercase text-muted-foreground block">Entry</span>
+                        <span className="text-lg font-bold text-blue-400 tabular-nums">{formatPrice(s.entry)}</span>
+                      </div>
+                      <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-center">
+                        <span className="text-[10px] uppercase text-muted-foreground block">Stop Loss</span>
+                        <span className="text-lg font-bold text-red-400 tabular-nums">{formatPrice(s.stopLoss)}</span>
+                      </div>
+                      <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3 text-center">
+                        <span className="text-[10px] uppercase text-muted-foreground block">Take Profit</span>
+                        <span className="text-lg font-bold text-emerald-400 tabular-nums">{formatPrice(s.takeProfit)}</span>
+                      </div>
+                    </div>
+
+                    {/* Market Data */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      {s.marketCap ? <div className="rounded-lg bg-secondary/40 p-2.5"><span className="text-[10px] text-muted-foreground block">Market Cap</span><span className="text-sm font-bold">{formatCompact(s.marketCap)}</span></div> : null}
+                      {s.volume24h ? <div className="rounded-lg bg-secondary/40 p-2.5"><span className="text-[10px] text-muted-foreground block">24h Volume</span><span className="text-sm font-bold">{formatCompact(s.volume24h)}</span></div> : null}
+                      {s.cmcRank ? <div className="rounded-lg bg-secondary/40 p-2.5"><span className="text-[10px] text-muted-foreground block">CMC Rank</span><span className="text-sm font-bold">#{s.cmcRank}</span></div> : null}
+                      {s.circulatingSupply ? <div className="rounded-lg bg-secondary/40 p-2.5"><span className="text-[10px] text-muted-foreground block">Circ. Supply</span><span className="text-sm font-bold">{formatCompact(s.circulatingSupply)}</span></div> : null}
+                    </div>
+
+                    {/* Price Changes */}
+                    <div className="flex gap-3">
+                      {s.priceChange24h !== undefined && (
+                        <div className="rounded-lg bg-secondary/40 p-2.5 flex-1">
+                          <span className="text-[10px] text-muted-foreground block">24h Change</span>
+                          <span className={cn('text-sm font-bold', s.priceChange24h >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                            {s.priceChange24h > 0 ? '+' : ''}{s.priceChange24h?.toFixed(2)}%
+                          </span>
+                        </div>
+                      )}
+                      {s.priceChange7d !== undefined && (
+                        <div className="rounded-lg bg-secondary/40 p-2.5 flex-1">
+                          <span className="text-[10px] text-muted-foreground block">7d Change</span>
+                          <span className={cn('text-sm font-bold', s.priceChange7d >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                            {s.priceChange7d > 0 ? '+' : ''}{s.priceChange7d?.toFixed(2)}%
+                          </span>
+                        </div>
+                      )}
+                      <div className="rounded-lg bg-secondary/40 p-2.5 flex-1">
+                        <span className="text-[10px] text-muted-foreground block">Leverage</span>
+                        <span className="text-sm font-bold">{s.leverage}x</span>
+                      </div>
+                      <div className="rounded-lg bg-secondary/40 p-2.5 flex-1">
+                        <span className="text-[10px] text-muted-foreground block">Risk:Reward</span>
+                        <span className="text-sm font-bold">{s.riskReward?.toFixed(2)}</span>
+                      </div>
+                    </div>
+
+                    {/* Technicals */}
+                    {s.technicals && (
+                      <div className="space-y-2">
+                        <h3 className="text-sm font-semibold text-blue-400">Technical Analysis</h3>
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">RSI (14)</span>
+                            <span className={cn('text-sm font-bold', s.technicals.rsi < 30 ? 'text-emerald-400' : s.technicals.rsi > 70 ? 'text-red-400' : 'text-foreground')}>
+                              {s.technicals.rsi?.toFixed(1)}
+                            </span>
+                            <div className="w-full h-1 rounded-full bg-muted mt-1 overflow-hidden">
+                              <div className={cn('h-full rounded-full', s.technicals.rsi < 30 ? 'bg-emerald-500' : s.technicals.rsi > 70 ? 'bg-red-500' : 'bg-blue-500')}
+                                style={{ width: `${s.technicals.rsi}%` }} />
+                            </div>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">MACD</span>
+                            <Badge variant={s.technicals.macd === 'bullish' ? 'success' : 'destructive'} className="text-xs mt-0.5">
+                              {s.technicals.macd}
+                            </Badge>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Trend</span>
+                            <Badge variant={s.technicals.trend === 'uptrend' ? 'success' : s.technicals.trend === 'downtrend' ? 'destructive' : 'warning'} className="text-xs mt-0.5">
+                              {s.technicals.trend}
+                            </Badge>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">EMA 20</span>
+                            <span className="text-sm font-bold tabular-nums">{formatPrice(s.technicals.ema20)}</span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">EMA 50</span>
+                            <span className="text-sm font-bold tabular-nums">{formatPrice(s.technicals.ema50)}</span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Bollinger</span>
+                            <span className="text-sm font-bold">{s.technicals.bollinger}</span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* News */}
+                    {s.news?.headline && (
+                      <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 space-y-1">
+                        <div className="flex items-center gap-1.5">
+                          <FileText className="w-3.5 h-3.5 text-amber-400" />
+                          <span className="text-xs font-semibold text-amber-400">News Sentiment</span>
+                        </div>
+                        <Badge variant={s.news.sentiment === 'bullish' ? 'success' : s.news.sentiment === 'bearish' ? 'destructive' : 'secondary'} className="text-[10px]">
+                          {s.news.sentiment?.toUpperCase()}
+                        </Badge>
+                        <p className="text-xs text-muted-foreground">{s.news.headline}</p>
+                        {s.news.source && <p className="text-[10px] text-zinc-500">— {s.news.source}</p>}
+                      </div>
+                    )}
+
+                    {/* Exchanges */}
+                    {s.exchanges?.length > 0 && (
+                      <div className="space-y-1.5">
+                        <h3 className="text-sm font-semibold text-blue-400 flex items-center gap-1.5"><Globe className="w-3.5 h-3.5" /> Available Exchanges</h3>
+                        <div className="flex flex-wrap gap-1.5">
+                          {s.exchanges.map((ex: string) => (
+                            <Badge key={ex} variant="outline" className="text-xs">{ex}</Badge>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Detailed Analysis */}
+                    {s.analysisDetail && (
+                      <div className="space-y-1.5 border-t border-border/40 pt-3">
+                        <h3 className="text-sm font-semibold text-blue-400">Detailed Analysis</h3>
+                        <p className="text-xs text-muted-foreground leading-relaxed whitespace-pre-line">{s.analysisDetail}</p>
+                      </div>
+                    )}
+
+                    {/* Reason */}
+                    {s.reason && (
+                      <div className="border-t border-border/40 pt-3">
+                        <h3 className="text-sm font-semibold text-muted-foreground">Trade Reason</h3>
+                        <p className="text-xs text-muted-foreground mt-1">{s.reason}</p>
+                      </div>
+                    )}
+
+                    {/* Confidence bar */}
+                    <div className="pt-2">
+                      <div className="flex justify-between text-[10px] text-muted-foreground mb-1">
+                        <span>Confidence</span>
+                        <span className={cn('font-bold', confColor(s.confidence))}>{s.confidence?.toFixed(0)}%</span>
+                      </div>
+                      <div className="w-full h-2 rounded-full bg-muted overflow-hidden">
+                        <motion.div className={cn('h-full rounded-full', confBg(s.confidence))} initial={{ width: 0 }} animate={{ width: `${s.confidence}%` }} transition={{ duration: 0.8 }} />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {detailModal.type === 'trench' && (() => {
+                const t = detailModal.data;
+                return (
+                  <div className="p-6 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <h2 className="text-xl font-bold">{t.symbol}</h2>
+                        <span className="text-sm text-muted-foreground">{t.name}</span>
+                        <Badge variant={t.ageLabel === 'NEW' ? 'success' : t.ageLabel === 'RECENT' ? 'warning' : 'info'} className="text-xs">{t.ageLabel}</Badge>
+                      </div>
+                      <Button variant="ghost" size="sm" onClick={() => setDetailModal(null)}>
+                        <X className="w-4 h-4" />
+                      </Button>
+                    </div>
+
+                    {/* Price & Core Stats */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="rounded-lg bg-purple-500/10 border border-purple-500/20 p-3 text-center">
+                        <span className="text-[10px] uppercase text-muted-foreground block">Price</span>
+                        <span className="text-lg font-bold text-purple-400 tabular-nums">{formatPrice(t.price)}</span>
+                      </div>
+                      <div className="rounded-lg bg-secondary/40 p-2.5 text-center">
+                        <span className="text-[10px] text-muted-foreground block">Market Cap</span>
+                        <span className="text-sm font-bold">{formatCompact(t.marketCap || 0)}</span>
+                      </div>
+                      <div className="rounded-lg bg-secondary/40 p-2.5 text-center">
+                        <span className="text-[10px] text-muted-foreground block">Liquidity</span>
+                        <span className="text-sm font-bold">{formatCompact(t.liquidity || 0)}</span>
+                      </div>
+                      <div className="rounded-lg bg-secondary/40 p-2.5 text-center">
+                        <span className="text-[10px] text-muted-foreground block">24h Volume</span>
+                        <span className="text-sm font-bold">{formatCompact(t.volume24h || 0)}</span>
+                      </div>
+                    </div>
+
+                    {/* Price Changes */}
+                    <div className="grid grid-cols-4 gap-2">
+                      {[
+                        { label: '5m', val: t.priceChange5m },
+                        { label: '1h', val: t.priceChange1h },
+                        { label: '6h', val: t.priceChange6h },
+                        { label: '24h', val: t.priceChange24h },
+                      ].map(pc => (
+                        <div key={pc.label} className="rounded-lg bg-secondary/40 p-2.5 text-center">
+                          <span className="text-[10px] text-muted-foreground block">{pc.label}</span>
+                          <span className={cn('text-sm font-bold tabular-nums', (pc.val || 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                            {(pc.val || 0) > 0 ? '+' : ''}{(pc.val || 0).toFixed(2)}%
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Transactions */}
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { label: '5m Txns', val: t.txns5m },
+                        { label: '1h Txns', val: t.txns1h },
+                        { label: '24h Txns', val: t.txns24h },
+                      ].map(tx => (
+                        <div key={tx.label} className="rounded-lg bg-secondary/40 p-2.5 text-center">
+                          <span className="text-[10px] text-muted-foreground block">{tx.label}</span>
+                          <span className="text-sm font-bold tabular-nums">{tx.val?.buys !== undefined ? `${tx.val.buys}B / ${tx.val.sells}S` : '—'}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Age */}
+                    <div className="flex gap-3">
+                      <div className="rounded-lg bg-secondary/40 p-2.5 flex-1">
+                        <span className="text-[10px] text-muted-foreground block">Age</span>
+                        <span className="text-sm font-bold">{formatAge(t.ageHours)}</span>
+                      </div>
+                      <div className="rounded-lg bg-secondary/40 p-2.5 flex-1">
+                        <span className="text-[10px] text-muted-foreground block">Created</span>
+                        <span className="text-sm font-bold">{t.pairCreatedAt ? new Date(t.pairCreatedAt).toLocaleString() : '—'}</span>
+                      </div>
+                      <div className="rounded-lg bg-secondary/40 p-2.5 flex-1">
+                        <span className="text-[10px] text-muted-foreground block">DEX</span>
+                        <span className="text-sm font-bold">{t.dexId || '—'}</span>
+                      </div>
+                    </div>
+
+                    {/* Fund Flow */}
+                    {t.fundFlow && (
+                      <div className="space-y-2">
+                        <h3 className="text-sm font-semibold text-purple-400">Fund Flow Analysis</h3>
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Net Flow</span>
+                            <span className={cn('text-sm font-bold', (t.fundFlow.netFlow || 0) >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+                              {formatCompact(t.fundFlow.netFlow || 0)}
+                            </span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Buy Volume</span>
+                            <span className="text-sm font-bold text-emerald-400">{formatCompact(t.fundFlow.buyVolume || 0)}</span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Sell Volume</span>
+                            <span className="text-sm font-bold text-red-400">{formatCompact(t.fundFlow.sellVolume || 0)}</span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Buy Pressure</span>
+                            <div className="flex items-center gap-1.5 mt-0.5">
+                              <span className={cn('text-sm font-bold', (t.fundFlow.buyPressure || 50) > 55 ? 'text-emerald-400' : (t.fundFlow.buyPressure || 50) < 45 ? 'text-red-400' : 'text-zinc-400')}>
+                                {(t.fundFlow.buyPressure || 50).toFixed(0)}%
+                              </span>
+                              <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                                <div className={cn('h-full rounded-full', (t.fundFlow.buyPressure || 50) > 55 ? 'bg-emerald-500' : 'bg-red-500')}
+                                  style={{ width: `${t.fundFlow.buyPressure || 50}%` }} />
+                              </div>
+                            </div>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Flow Trend</span>
+                            <span className={cn('text-sm font-bold', flowColor(t.fundFlow.flowTrend || 'neutral'))}>
+                              {t.fundFlow.flowTrend === 'accumulating' ? '↗ Accumulating' : t.fundFlow.flowTrend === 'distributing' ? '↘ Distributing' : '— Neutral'}
+                            </span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Pump Score</span>
+                            <div className="flex items-center gap-1.5 mt-0.5">
+                              <span className={cn('text-sm font-bold', pumpScoreColor(t.fundFlow.pumpScore || 0))}>{t.fundFlow.pumpScore || 0}</span>
+                              <span className="text-[10px] text-muted-foreground">/100</span>
+                              <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                                <div className={cn('h-full rounded-full', pumpScoreBg(t.fundFlow.pumpScore || 0))} style={{ width: `${t.fundFlow.pumpScore || 0}%` }} />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                        {t.fundFlow.pumpReasons?.length > 0 && (
+                          <div className="rounded-lg bg-amber-500/5 border border-amber-500/20 p-2.5">
+                            <span className="text-[10px] font-semibold text-amber-400 block mb-1">Pump Indicators</span>
+                            <div className="flex flex-wrap gap-1">
+                              {t.fundFlow.pumpReasons.map((r: string, i: number) => (
+                                <Badge key={i} variant="warning" className="text-[9px]">{r}</Badge>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Links */}
+                    <div className="flex gap-2 pt-2 border-t border-border/40">
+                      {t.url && (
+                        <a href={t.url} target="_blank" rel="noopener noreferrer">
+                          <Button variant="outline" size="sm" className="gap-1.5">
+                            <ExternalLink className="w-3 h-3" /> DexScreener
+                          </Button>
+                        </a>
+                      )}
+                      {t.address && (
+                        <a href={`https://solscan.io/token/${t.address}`} target="_blank" rel="noopener noreferrer">
+                          <Button variant="outline" size="sm" className="gap-1.5">
+                            <ExternalLink className="w-3 h-3" /> Solscan
+                          </Button>
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

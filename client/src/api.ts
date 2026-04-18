@@ -36,11 +36,12 @@ export const api = {
   getSentiment: (symbol: string) => fetchJSON(`/news/sentiment/${encodeURIComponent(symbol)}`),
 
   getWallets: () => fetchJSON('/wallets'),
-  addWallet: (address: string) =>
-    fetchJSON('/wallets', { method: 'POST', body: JSON.stringify({ address }) }),
+  addWallet: (address: string, label?: string) =>
+    fetchJSON('/wallets', { method: 'POST', body: JSON.stringify({ address, label }) }),
   removeWallet: (address: string) =>
     fetchJSON(`/wallets/${encodeURIComponent(address)}`, { method: 'DELETE' }),
   scanWallets: () => fetchJSON('/wallets/scan'),
+  discoverWhales: () => fetchJSON('/wallets/discover', { method: 'POST' }),
 
   getPositions: () => fetchJSON('/positions'),
   closePosition: (id: string) =>
@@ -56,10 +57,12 @@ export const api = {
 
   // Futures setups
   getFuturesSetups: () => fetchJSON('/futures/setups'),
+  getFuturesSetupDetail: (id: string) => fetchJSON(`/futures/setups/${encodeURIComponent(id)}`),
   generateFuturesSetups: () => fetchJSON('/futures/generate', { method: 'POST' }),
 
   // Sol trenches
   getTrenches: () => fetchJSON('/trenches'),
+  getTrenchTokenDetail: (address: string) => fetchJSON(`/trenches/${encodeURIComponent(address)}`),
   scanTrenches: () => fetchJSON('/trenches/scan', { method: 'POST' }),
   trackTrenchToken: (address: string) =>
     fetchJSON('/trenches/track', { method: 'POST', body: JSON.stringify({ address }) }),

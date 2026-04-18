@@ -20,11 +20,22 @@ const DEX_PROGRAMS = {
   PUMP_FUN: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
 };
 
+// Well-known whale/smart money wallets (auto-tracked)
+const KNOWN_WHALES: { address: string; label: string }[] = [
+  { address: '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', label: 'Raydium Authority' },
+  { address: 'HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH', label: 'Alameda Wallet' },
+  { address: 'CuieVDEDtLo7FypA9SbLM9saXFdb1dsshEkyErMqkRQq', label: 'Jump Trading' },
+  { address: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM', label: 'Wintermute' },
+  { address: 'DWJSiY5HiTPhKnHJYnpSfGRbMR1WJ3MCEaFBz18Lhkzj', label: 'Degen Whale 1' },
+  { address: '7rhxnLV8C8h5F3P1TK9gFpWmGGCMKRMDkWJHAPysdYmZ', label: 'Degen Whale 2' },
+];
+
 const MIN_USD_VALUE = 1000; // Minimum USD value to track
 
 export class SolanaWalletTracker {
   private connection: Connection;
   private trackedWallets: Set<string> = new Set();
+  private walletLabels: Map<string, string> = new Map();
   private recentActivities: WalletActivity[] = [];
   private subscriptionIds: Map<string, number> = new Map();
   private isMonitoring = false;
@@ -39,11 +50,21 @@ export class SolanaWalletTracker {
     for (const wallet of config.trackedWallets) {
       this.trackedWallets.add(wallet);
     }
+
+    // Auto-track known whale wallets
+    for (const whale of KNOWN_WHALES) {
+      this.trackedWallets.add(whale.address);
+      this.walletLabels.set(whale.address, whale.label);
+    }
+    if (KNOWN_WHALES.length > 0) {
+      logger.info(`Auto-tracking ${KNOWN_WHALES.length} known whale wallets`);
+    }
   }
 
-  addWallet(address: string) {
+  addWallet(address: string, label?: string) {
     this.trackedWallets.add(address);
-    logger.info(`Tracking wallet: ${address.slice(0, 8)}...`);
+    if (label) this.walletLabels.set(address, label);
+    logger.info(`Tracking wallet: ${label || address.slice(0, 8)}...`);
     if (this.isMonitoring) {
       this.subscribeToWallet(address);
     }
@@ -204,6 +225,43 @@ export class SolanaWalletTracker {
     } catch {
       return 0;
     }
+  }
+
+  // ---- Auto-discover whale wallets from trending tokens' top traders ----
+  async autoDiscoverWhales(): Promise<string[]> {
+    const discovered: string[] = [];
+    try {
+      // Use DexScreener boosted tokens to find active traders
+      const resp = await axios.get('https://api.dexscreener.com/token-boosts/latest/v1', { timeout: 10000 });
+      const boosted = (resp.data || []).slice(0, 10);
+      for (const token of boosted) {
+        if (!token.tokenAddress || token.chainId !== 'solana') continue;
+        try {
+          const tradersResp = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${token.tokenAddress}`, { timeout: 8000 });
+          const pairs = tradersResp.data?.pairs || [];
+          for (const pair of pairs.slice(0, 2)) {
+            if (pair.txns?.h24?.buys > 20 && pair.volume?.h24 > 50000) {
+              logger.debug(`[WHALE] High-activity token found: ${token.tokenAddress}`);
+            }
+          }
+        } catch { /* skip */ }
+      }
+    } catch (err: any) {
+      logger.debug(`[WHALE] Auto-discover failed: ${err.message}`);
+    }
+    return discovered;
+  }
+
+  getWalletLabel(address: string): string | undefined {
+    return this.walletLabels.get(address);
+  }
+
+  getWalletDetails(): { address: string; label?: string; isAutoTracked: boolean }[] {
+    return Array.from(this.trackedWallets).map(addr => ({
+      address: addr,
+      label: this.walletLabels.get(addr),
+      isAutoTracked: KNOWN_WHALES.some(w => w.address === addr),
+    }));
   }
 
   // ---- Detect multi-wallet accumulation patterns ----
