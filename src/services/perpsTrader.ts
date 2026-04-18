@@ -396,9 +396,51 @@ export class PerpsTrader {
     let candles = await this.fetchGateIOOHLCV(symbol, '15m', limit);
     if (candles.length >= 50) return candles;
 
+    // Try CoinGecko OHLCV (free, no key)
+    candles = await this.fetchCoinGeckoOHLCV(symbol, limit);
+    if (candles.length >= 50) return candles;
+
     // Fallback to CryptoCompare (spot data, still useful for technicals)
     candles = await this.fetchCryptoCompareOHLCV(symbol, limit);
     return candles;
+  }
+
+  // ---- CoinGecko OHLCV data (free, no key) ----
+  private async fetchCoinGeckoOHLCV(symbol: string, limit: number = 100): Promise<number[][]> {
+    try {
+      const cgId = PerpsTrader.COINGECKO_IDS[symbol];
+      if (!cgId) {
+        // Try to resolve the id dynamically
+        const searchResp = await axios.get('https://api.coingecko.com/api/v3/search', {
+          params: { query: symbol },
+          timeout: 8000,
+        });
+        const coin = searchResp.data?.coins?.[0];
+        if (!coin?.id) return [];
+        // Cache for future lookups
+        PerpsTrader.COINGECKO_IDS[symbol] = coin.id;
+        return this.fetchCoinGeckoOHLCVById(coin.id, limit);
+      }
+      return this.fetchCoinGeckoOHLCVById(cgId, limit);
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchCoinGeckoOHLCVById(cgId: string, limit: number): Promise<number[][]> {
+    try {
+      // CoinGecko /ohlc endpoint: days=1 gives ~15min candles, days=7 gives hourly
+      // For ~100 15-min candles we need 1 day of data
+      const resp = await axios.get(`https://api.coingecko.com/api/v3/coins/${cgId}/ohlc`, {
+        params: { vs_currency: 'usd', days: 1 },
+        timeout: 10000,
+      });
+      const raw = resp.data || [];
+      // CoinGecko returns [timestamp, open, high, low, close] — add volume=0
+      return raw.map((c: number[]) => [c[0], c[1], c[2], c[3], c[4], 0]);
+    } catch {
+      return [];
+    }
   }
 
   // ---- Get available futures symbols from Gate.io ----
@@ -457,10 +499,54 @@ export class PerpsTrader {
     return PerpsTrader.EXCHANGE_LISTINGS[symbol] || ['Gate.io'];
   }
 
+  // ---- Dynamically fetch exchange listings from CoinGecko tickers ----
+  private exchangeTickerCache: Map<string, { exchanges: string[]; ts: number }> = new Map();
+
+  private async fetchExchangeListings(symbol: string): Promise<string[]> {
+    // Cache for 30 minutes
+    const cached = this.exchangeTickerCache.get(symbol);
+    if (cached && Date.now() - cached.ts < 1800000) return cached.exchanges;
+
+    // If we have hardcoded data, use it as base
+    const hardcoded = PerpsTrader.EXCHANGE_LISTINGS[symbol];
+
+    try {
+      const cgId = PerpsTrader.COINGECKO_IDS[symbol];
+      if (!cgId) return hardcoded || ['Gate.io'];
+
+      const resp = await axios.get(`https://api.coingecko.com/api/v3/coins/${cgId}/tickers`, {
+        params: { include_exchange_logo: false, depth: false },
+        timeout: 10000,
+      });
+      const tickers = resp.data?.tickers || [];
+      const exchangeSet = new Set<string>();
+      for (const t of tickers) {
+        if (t.market?.name) {
+          exchangeSet.add(t.market.name);
+        }
+      }
+      // Keep well-known exchanges, prioritize popular ones first
+      const knownOrder = ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC', 'KuCoin', 'Coinbase Exchange', 'Kraken', 'HTX', 'Bitfinex', 'dYdX', 'Hyperliquid', 'Crypto.com Exchange'];
+      const sorted: string[] = [];
+      for (const ex of knownOrder) {
+        if (exchangeSet.has(ex)) sorted.push(ex);
+      }
+      // Add remaining exchanges not in known list
+      for (const ex of exchangeSet) {
+        if (!sorted.includes(ex) && sorted.length < 15) sorted.push(ex);
+      }
+      const result = sorted.length > 0 ? sorted : (hardcoded || ['Gate.io']);
+      this.exchangeTickerCache.set(symbol, { exchanges: result, ts: Date.now() });
+      return result;
+    } catch {
+      return hardcoded || ['Gate.io'];
+    }
+  }
+
   // ---- CoinGecko market data (free, no key) ----
   private coinGeckoCache: Map<string, { data: any; ts: number }> = new Map();
 
-  private static readonly COINGECKO_IDS: Record<string, string> = {
+  private static COINGECKO_IDS: Record<string, string> = {
     'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'BNB': 'binancecoin',
     'XRP': 'ripple', 'DOGE': 'dogecoin', 'ADA': 'cardano', 'AVAX': 'avalanche-2',
     'DOT': 'polkadot', 'LINK': 'chainlink', 'MATIC': 'matic-network', 'UNI': 'uniswap',
@@ -925,8 +1011,12 @@ export class PerpsTrader {
         setup.maxSupply = cmc.maxSupply;
       }
 
-      // Exchange availability
-      setup.exchanges = this.getExchangesForSymbol(setup.symbol);
+      // Exchange availability — try dynamic CoinGecko tickers, fall back to static map
+      try {
+        setup.exchanges = await this.fetchExchangeListings(setup.symbol);
+      } catch {
+        setup.exchanges = this.getExchangesForSymbol(setup.symbol);
+      }
 
       // Detailed analysis summary
       setup.analysisDetail = this.buildAnalysisDetail(setup);
@@ -973,6 +1063,11 @@ export class PerpsTrader {
 
     // Risk/Reward
     parts.push(`Risk/Reward: ${setup.riskReward.toFixed(1)}:1 — SL ${((Math.abs(setup.entry - setup.stopLoss) / setup.entry) * 100).toFixed(2)}% from entry`);
+
+    // Where to trade
+    if (setup.exchanges?.length > 0) {
+      parts.push(`Available on: ${setup.exchanges.join(', ')}`);
+    }
 
     // News
     if (setup.news?.headline) {
