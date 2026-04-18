@@ -1,0 +1,1098 @@
+// ============================================
+// PERPS TRADING ENGINE
+// Executes perpetual futures trades via CCXT
+// Supports: Binance, Bybit, OKX, Hyperliquid
+// ============================================
+
+import ccxt, { Exchange, Order, Balances } from 'ccxt';
+import axios from 'axios';
+import { RSI, MACD, EMA, BollingerBands } from 'technicalindicators';
+import { config } from '../config';
+import { logger } from '../utils/logger';
+import { Position, AggregatedSignal } from '../types';
+import { v4Fallback } from '../utils/id';
+
+const CMC_API_KEY = process.env.CMC_API_KEY || '';
+const CMC_BASE = 'https://pro-api.coinmarketcap.com/v1';
+
+export class PerpsTrader {
+  private exchange: Exchange | null = null;
+  private positions: Map<string, Position> = new Map();
+  private isInitialized = false;
+
+  // ---- Initialize exchange connection ----
+  async initialize(): Promise<boolean> {
+    try {
+      const ExchangeClass = (ccxt as any)[config.exchange.id];
+      if (!ExchangeClass) {
+        logger.error(`Exchange '${config.exchange.id}' not supported by CCXT`);
+        return false;
+      }
+
+      this.exchange = new ExchangeClass({
+        apiKey: config.exchange.apiKey,
+        secret: config.exchange.secret,
+        password: config.exchange.password || undefined,
+        options: {
+          defaultType: 'future',
+          adjustForTimeDifference: true,
+        },
+      });
+
+      if (config.exchange.sandbox) {
+        this.exchange!.setSandboxMode(true);
+        logger.info('Exchange running in SANDBOX mode');
+      }
+
+      // Test connection
+      await this.exchange!.loadMarkets();
+      const balance: any = await this.exchange!.fetchBalance();
+      const totalUSDT = balance.total?.USDT || balance.total?.USD || 0;
+      logger.info(`Exchange connected: ${config.exchange.id} | Balance: $${totalUSDT}`);
+
+      this.isInitialized = true;
+      return true;
+    } catch (err: any) {
+      logger.error(`Exchange init failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  isReady(): boolean {
+    return this.isInitialized && this.exchange !== null;
+  }
+
+  // ---- Get account balance ----
+  async getBalance(): Promise<{ total: number; free: number; used: number }> {
+    if (!this.exchange) return { total: 0, free: 0, used: 0 };
+    try {
+      const balance: any = await this.exchange.fetchBalance();
+      return {
+        total: balance.total?.USDT || balance.total?.USD || 0,
+        free: balance.free?.USDT || balance.free?.USD || 0,
+        used: balance.used?.USDT || balance.used?.USD || 0,
+      };
+    } catch (err: any) {
+      logger.error(`Balance fetch failed: ${err.message}`);
+      return { total: 0, free: 0, used: 0 };
+    }
+  }
+
+  // ---- Set leverage for a symbol ----
+  async setLeverage(symbol: string, leverage: number): Promise<boolean> {
+    if (!this.exchange) return false;
+    try {
+      await this.exchange.setLeverage(leverage, symbol);
+      logger.info(`Leverage set to ${leverage}x for ${symbol}`);
+      return true;
+    } catch (err: any) {
+      logger.warn(`setLeverage failed for ${symbol}: ${err.message}`);
+      return false;
+    }
+  }
+
+  // ---- Open a perpetual position ----
+  async openPosition(signal: AggregatedSignal): Promise<Position | null> {
+    if (!this.exchange) {
+      logger.error('Exchange not initialized');
+      return null;
+    }
+
+    // Check max positions
+    if (this.positions.size >= config.trading.maxPositions) {
+      logger.warn('Max positions reached, skipping');
+      return null;
+    }
+
+    // Build the trading symbol (e.g., BTC/USDT:USDT for perps)
+    const tradingSymbol = this.buildPerpsSymbol(signal.symbol);
+    if (!tradingSymbol) {
+      logger.warn(`Cannot build perps symbol for ${signal.symbol}`);
+      return null;
+    }
+
+    const side = signal.direction === 'LONG' ? 'buy' : 'sell';
+    const leverage = config.trading.defaultLeverage;
+
+    try {
+      // Set leverage
+      await this.setLeverage(tradingSymbol, leverage);
+
+      // Calculate position size
+      const balance = await this.getBalance();
+      const positionUSD = Math.min(config.trading.maxPositionSize, balance.free * 0.2);
+      const ticker = await this.exchange.fetchTicker(tradingSymbol);
+      const currentPrice = ticker.last || signal.suggestedEntry;
+
+      if (!currentPrice || currentPrice <= 0) {
+        logger.error(`Invalid price for ${tradingSymbol}`);
+        return null;
+      }
+
+      const amount = (positionUSD * leverage) / currentPrice;
+
+      // Place market order
+      logger.info(`Opening ${side.toUpperCase()} ${tradingSymbol} | Size: $${positionUSD} | ${leverage}x`);
+      const order: Order = await this.exchange.createOrder(
+        tradingSymbol,
+        'market',
+        side,
+        amount
+      );
+
+      const entryPrice = order.average || order.price || currentPrice;
+
+      // Calculate SL/TP
+      const slMultiplier = signal.direction === 'LONG' ? (1 - config.trading.stopLossPct / 100) : (1 + config.trading.stopLossPct / 100);
+      const tpMultiplier = signal.direction === 'LONG' ? (1 + config.trading.takeProfitPct / 100) : (1 - config.trading.takeProfitPct / 100);
+      const stopLoss = signal.suggestedSL || entryPrice * slMultiplier;
+      const takeProfit = signal.suggestedTP || entryPrice * tpMultiplier;
+
+      // Place stop loss order
+      try {
+        const slSide = signal.direction === 'LONG' ? 'sell' : 'buy';
+        await this.exchange.createOrder(tradingSymbol, 'stop', slSide, amount, stopLoss, {
+          stopPrice: stopLoss,
+          reduceOnly: true,
+        });
+      } catch (slErr: any) {
+        logger.warn(`SL order failed (will manage manually): ${slErr.message}`);
+      }
+
+      // Place take profit order
+      try {
+        const tpSide = signal.direction === 'LONG' ? 'sell' : 'buy';
+        await this.exchange.createOrder(tradingSymbol, 'limit', tpSide, amount, takeProfit, {
+          reduceOnly: true,
+        });
+      } catch (tpErr: any) {
+        logger.warn(`TP order failed (will manage manually): ${tpErr.message}`);
+      }
+
+      const position: Position = {
+        id: v4Fallback(),
+        exchange: config.exchange.id,
+        symbol: tradingSymbol,
+        side: signal.direction,
+        entryPrice,
+        currentPrice: entryPrice,
+        size: positionUSD,
+        leverage,
+        pnl: 0,
+        pnlPct: 0,
+        stopLoss,
+        takeProfit,
+        openedAt: Date.now(),
+        status: 'open',
+      };
+
+      this.positions.set(position.id, position);
+      logger.info(`Position opened: ${position.id} | ${tradingSymbol} ${signal.direction} @ ${entryPrice}`);
+      return position;
+    } catch (err: any) {
+      logger.error(`Failed to open position for ${tradingSymbol}: ${err.message}`);
+      return null;
+    }
+  }
+
+  // ---- Close a position ----
+  async closePosition(positionId: string): Promise<boolean> {
+    if (!this.exchange) return false;
+
+    const position = this.positions.get(positionId);
+    if (!position || position.status === 'closed') return false;
+
+    try {
+      const closeSide = position.side === 'LONG' ? 'sell' : 'buy';
+      const ticker = await this.exchange.fetchTicker(position.symbol);
+      const currentPrice = ticker.last || 0;
+      const amount = (position.size * position.leverage) / position.entryPrice;
+
+      await this.exchange.createOrder(position.symbol, 'market', closeSide, amount, undefined, {
+        reduceOnly: true,
+      });
+
+      position.status = 'closed';
+      position.currentPrice = currentPrice;
+      if (position.side === 'LONG') {
+        position.pnl = (currentPrice - position.entryPrice) / position.entryPrice * position.size * position.leverage;
+      } else {
+        position.pnl = (position.entryPrice - currentPrice) / position.entryPrice * position.size * position.leverage;
+      }
+      position.pnlPct = (position.pnl / position.size) * 100;
+
+      logger.info(`Position closed: ${positionId} | PnL: $${position.pnl.toFixed(2)} (${position.pnlPct.toFixed(2)}%)`);
+      return true;
+    } catch (err: any) {
+      logger.error(`Failed to close position ${positionId}: ${err.message}`);
+      return false;
+    }
+  }
+
+  // ---- Update all open positions with current prices ----
+  async updatePositions(): Promise<Position[]> {
+    if (!this.exchange) return [];
+
+    for (const [, position] of this.positions) {
+      if (position.status !== 'open') continue;
+
+      try {
+        const ticker = await this.exchange.fetchTicker(position.symbol);
+        position.currentPrice = ticker.last || position.currentPrice;
+
+        if (position.side === 'LONG') {
+          position.pnl = (position.currentPrice - position.entryPrice) / position.entryPrice * position.size * position.leverage;
+        } else {
+          position.pnl = (position.entryPrice - position.currentPrice) / position.entryPrice * position.size * position.leverage;
+        }
+        position.pnlPct = (position.pnl / position.size) * 100;
+
+        // Check if SL/TP triggered (manual management fallback)
+        if (position.side === 'LONG') {
+          if (position.currentPrice <= position.stopLoss || position.currentPrice >= position.takeProfit) {
+            await this.closePosition(position.id);
+          }
+        } else {
+          if (position.currentPrice >= position.stopLoss || position.currentPrice <= position.takeProfit) {
+            await this.closePosition(position.id);
+          }
+        }
+      } catch (err: any) {
+        logger.warn(`Price update failed for ${position.symbol}: ${err.message}`);
+      }
+    }
+
+    return this.getOpenPositions();
+  }
+
+  // ---- Get positions ----
+  getOpenPositions(): Position[] {
+    return Array.from(this.positions.values()).filter((p) => p.status === 'open');
+  }
+
+  getAllPositions(): Position[] {
+    return Array.from(this.positions.values());
+  }
+
+  getTotalPnL(): number {
+    return Array.from(this.positions.values()).reduce((sum, p) => sum + p.pnl, 0);
+  }
+
+  // ---- Fetch available perps markets ----
+  async getAvailableMarkets(): Promise<string[]> {
+    if (!this.exchange) return [];
+    try {
+      const markets = await this.exchange.loadMarkets();
+      return Object.keys(markets).filter((s) => markets[s]?.swap || markets[s]?.future);
+    } catch {
+      return [];
+    }
+  }
+
+  // ---- Build perpetual symbol format ----
+  private buildPerpsSymbol(baseSymbol: string): string | null {
+    if (!this.exchange) return null;
+
+    // Try common perps formats
+    const candidates = [
+      `${baseSymbol}/USDT:USDT`,
+      `${baseSymbol}/USD:USD`,
+      `${baseSymbol}/USDC:USDC`,
+      `${baseSymbol}USDT`,
+    ];
+
+    for (const candidate of candidates) {
+      if (this.exchange.markets && this.exchange.markets[candidate]) {
+        return candidate;
+      }
+    }
+
+    // Fallback
+    return `${baseSymbol}/USDT:USDT`;
+  }
+
+  // ---- Get OHLCV data from exchange ----
+  async getOHLCV(symbol: string, timeframe: string = '15m', limit: number = 100): Promise<any[]> {
+    if (!this.exchange) return [];
+    try {
+      const tradingSymbol = this.buildPerpsSymbol(symbol) || `${symbol}/USDT:USDT`;
+      return await this.exchange.fetchOHLCV(tradingSymbol, timeframe, undefined, limit);
+    } catch (err: any) {
+      logger.warn(`OHLCV fetch failed for ${symbol}: ${err.message}`);
+      return [];
+    }
+  }
+
+  // ========================================
+  // FUTURES SCANNER
+  // Scans exchange-listed perps for setups
+  // ========================================
+
+  // Major perps tokens to scan when exchange isn't connected
+  private static readonly FUTURES_SYMBOLS = [
+    'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'AVAX', 'DOT', 'LINK',
+    'MATIC', 'UNI', 'ATOM', 'LTC', 'FIL', 'NEAR', 'APT', 'ARB', 'OP', 'SUI',
+    'INJ', 'TIA', 'SEI', 'WIF', 'PEPE', 'BONK', 'ORDI', 'JTO', 'PYTH', 'JUP',
+    'RENDER', 'FET', 'AAVE', 'MKR', 'CRV', 'RUNE', 'STX', 'IMX', 'MANA', 'SAND',
+  ];
+
+  private futuresSetups: FuturesSetup[] = [];
+
+  // ---- Fetch OHLCV from Gate.io public futures API (no key needed) ----
+  private async fetchGateIOOHLCV(symbol: string, interval: string = '15m', limit: number = 100): Promise<number[][]> {
+    try {
+      // Gate.io uses underscore format: BTC_USDT
+      const contract = `${symbol}_USDT`;
+      // Gate.io interval format: 15m, 1h, 4h, 1d
+      const resp = await axios.get('https://api.gateio.ws/api/v4/futures/usdt/candlesticks', {
+        params: { contract, interval, limit },
+        timeout: 10000,
+      });
+      // Gate.io returns: { t, o, h, l, c, v, sum }
+      return (resp.data || []).map((k: any) => [
+        Number(k.t) * 1000, // timestamp to ms
+        Number(k.o),        // open
+        Number(k.h),        // high
+        Number(k.l),        // low
+        Number(k.c),        // close
+        Number(k.v),        // volume
+      ]);
+    } catch {
+      return [];
+    }
+  }
+
+  // ---- Fallback: Fetch OHLCV from CryptoCompare (no key needed) ----
+  private async fetchCryptoCompareOHLCV(symbol: string, limit: number = 100): Promise<number[][]> {
+    try {
+      // CryptoCompare doesn't have 15m directly; use histominute with limit*15 then aggregate
+      const resp = await axios.get('https://min-api.cryptocompare.com/data/v2/histominute', {
+        params: { fsym: symbol, tsym: 'USD', limit: Math.min(limit * 15, 2000), e: 'CCCAGG' },
+        timeout: 15000,
+      });
+      const minuteData = resp.data?.Data?.Data || [];
+      if (minuteData.length < 15) return [];
+
+      // Aggregate 1m candles into 15m candles
+      const candles: number[][] = [];
+      for (let i = 0; i + 14 < minuteData.length; i += 15) {
+        const chunk = minuteData.slice(i, i + 15);
+        const open = chunk[0].open;
+        const close = chunk[chunk.length - 1].close;
+        const high = Math.max(...chunk.map((c: any) => c.high));
+        const low = Math.min(...chunk.map((c: any) => c.low));
+        const vol = chunk.reduce((s: number, c: any) => s + (c.volumeto || 0), 0);
+        candles.push([chunk[0].time * 1000, open, high, low, close, vol]);
+      }
+      return candles;
+    } catch {
+      return [];
+    }
+  }
+
+  // ---- Fetch OHLCV with fallback chain: Gate.io -> CryptoCompare ----
+  private async fetchFuturesOHLCV(symbol: string, limit: number = 100): Promise<number[][]> {
+    // Try Gate.io first (real futures data)
+    let candles = await this.fetchGateIOOHLCV(symbol, '15m', limit);
+    if (candles.length >= 50) return candles;
+
+    // Fallback to CryptoCompare (spot data, still useful for technicals)
+    candles = await this.fetchCryptoCompareOHLCV(symbol, limit);
+    return candles;
+  }
+
+  // ---- Get available futures symbols from Gate.io ----
+  private async fetchExchangeFuturesSymbols(): Promise<string[]> {
+    try {
+      const resp = await axios.get('https://api.gateio.ws/api/v4/futures/usdt/contracts', {
+        timeout: 10000,
+      });
+      const contracts = (resp.data || [])
+        .filter((c: any) => c.name?.endsWith('_USDT'))
+        .map((c: any) => ({
+          symbol: c.name.replace('_USDT', ''),
+          volume: Number(c.trade_size || 0),
+        }))
+        .sort((a: any, b: any) => b.volume - a.volume)
+        .slice(0, 80)
+        .map((c: any) => c.symbol);
+      return contracts.length > 0 ? contracts : PerpsTrader.FUTURES_SYMBOLS;
+    } catch {
+      return PerpsTrader.FUTURES_SYMBOLS;
+    }
+  }
+
+  // ---- Which exchanges list a token for futures trading ----
+  private static readonly EXCHANGE_LISTINGS: Record<string, string[]> = {
+    'BTC': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC', 'KuCoin', 'dYdX', 'Hyperliquid'],
+    'ETH': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC', 'KuCoin', 'dYdX', 'Hyperliquid'],
+    'SOL': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC', 'KuCoin', 'Hyperliquid'],
+    'BNB': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'XRP': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC', 'KuCoin'],
+    'DOGE': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC', 'KuCoin'],
+    'ADA': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'AVAX': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'DOT': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'LINK': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC', 'KuCoin'],
+    'MATIC': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'UNI': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'ATOM': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'LTC': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'NEAR': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'APT': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'ARB': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'OP': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'SUI': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'INJ': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'WIF': ['Binance', 'Bybit', 'Gate.io', 'Bitget', 'MEXC'],
+    'PEPE': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget', 'MEXC'],
+    'FET': ['Binance', 'Bybit', 'OKX', 'Gate.io', 'Bitget'],
+    'RENDER': ['Binance', 'Bybit', 'OKX', 'Gate.io'],
+    'AAVE': ['Binance', 'Bybit', 'OKX', 'Gate.io'],
+    'CRV': ['Binance', 'Bybit', 'OKX', 'Gate.io'],
+    'RUNE': ['Binance', 'Bybit', 'Gate.io'],
+  };
+
+  private getExchangesForSymbol(symbol: string): string[] {
+    return PerpsTrader.EXCHANGE_LISTINGS[symbol] || ['Gate.io'];
+  }
+
+  // ---- CoinGecko market data (free, no key) ----
+  private coinGeckoCache: Map<string, { data: any; ts: number }> = new Map();
+
+  private static readonly COINGECKO_IDS: Record<string, string> = {
+    'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'BNB': 'binancecoin',
+    'XRP': 'ripple', 'DOGE': 'dogecoin', 'ADA': 'cardano', 'AVAX': 'avalanche-2',
+    'DOT': 'polkadot', 'LINK': 'chainlink', 'MATIC': 'matic-network', 'UNI': 'uniswap',
+    'ATOM': 'cosmos', 'LTC': 'litecoin', 'FIL': 'filecoin', 'NEAR': 'near',
+    'APT': 'aptos', 'ARB': 'arbitrum', 'OP': 'optimism', 'SUI': 'sui',
+    'INJ': 'injective-protocol', 'TIA': 'celestia', 'SEI': 'sei-network',
+    'WIF': 'dogwifcoin', 'PEPE': 'pepe', 'BONK': 'bonk',
+    'RENDER': 'render-token', 'FET': 'fetch-ai', 'AAVE': 'aave', 'MKR': 'maker',
+    'CRV': 'curve-dao-token', 'RUNE': 'thorchain', 'STX': 'blockstack',
+    'IMX': 'immutable-x', 'MANA': 'decentraland', 'SAND': 'the-sandbox',
+    'DYDX': 'dydx-chain', 'ICP': 'internet-computer', 'SHIB': 'shiba-inu',
+    'JASMY': 'jasmycoin', 'FLOW': 'flow',
+  };
+
+  private async fetchCoinGeckoData(symbols: string[]): Promise<Map<string, any>> {
+    const result = new Map<string, any>();
+    const ids = symbols
+      .map(s => PerpsTrader.COINGECKO_IDS[s])
+      .filter(Boolean);
+    if (ids.length === 0) return result;
+
+    // Check cache (60s TTL)
+    const now = Date.now();
+    const uncachedIds: string[] = [];
+    for (const s of symbols) {
+      const cached = this.coinGeckoCache.get(s);
+      if (cached && now - cached.ts < 60000) {
+        result.set(s, cached.data);
+      } else {
+        uncachedIds.push(s);
+      }
+    }
+
+    if (uncachedIds.length === 0) return result;
+
+    const cgIds = uncachedIds.map(s => PerpsTrader.COINGECKO_IDS[s]).filter(Boolean);
+    if (cgIds.length === 0) return result;
+
+    try {
+      // CoinGecko allows up to 250 ids per request
+      const resp = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+        params: {
+          ids: cgIds.join(','),
+          vs_currencies: 'usd',
+          include_market_cap: true,
+          include_24hr_vol: true,
+          include_24hr_change: true,
+        },
+        timeout: 10000,
+      });
+
+      const data = resp.data || {};
+      for (const s of uncachedIds) {
+        const cgId = PerpsTrader.COINGECKO_IDS[s];
+        if (cgId && data[cgId]) {
+          const d = {
+            marketCap: data[cgId].usd_market_cap || 0,
+            volume24h: data[cgId].usd_24h_vol || 0,
+            priceChange24h: data[cgId].usd_24h_change || 0,
+          };
+          result.set(s, d);
+          this.coinGeckoCache.set(s, { data: d, ts: now });
+        }
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] CoinGecko fetch failed: ${err.message}`);
+    }
+
+    return result;
+  }
+
+  // ---- CoinMarketCap: discover trending/gainers for more futures coins ----
+  private cmcCache: { symbols: string[]; ts: number } = { symbols: [], ts: 0 };
+
+  private async fetchCMCTrendingSymbols(): Promise<string[]> {
+    // Cache for 10 minutes
+    if (Date.now() - this.cmcCache.ts < 600000 && this.cmcCache.symbols.length > 0) {
+      return this.cmcCache.symbols;
+    }
+
+    const symbols: string[] = [];
+
+    try {
+      if (CMC_API_KEY) {
+        // With API key: use CMC's listings endpoint sorted by % change
+        const resp = await axios.get(`${CMC_BASE}/cryptocurrency/listings/latest`, {
+          headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
+          params: { start: 1, limit: 100, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'USD' },
+          timeout: 10000,
+        });
+        const listings = resp.data?.data || [];
+        for (const coin of listings) {
+          if (coin.symbol && !symbols.includes(coin.symbol)) {
+            symbols.push(coin.symbol);
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] CMC listings fetch failed: ${err.message}`);
+    }
+
+    // Fallback: use CoinGecko trending coins (no key needed)
+    try {
+      const resp = await axios.get('https://api.coingecko.com/api/v3/search/trending', { timeout: 10000 });
+      const coins = resp.data?.coins || [];
+      for (const c of coins) {
+        const sym = c.item?.symbol?.toUpperCase();
+        if (sym && !symbols.includes(sym)) symbols.push(sym);
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] CoinGecko trending fetch failed: ${err.message}`);
+    }
+
+    // Also get CoinGecko top gainers
+    try {
+      const resp = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
+        params: { vs_currency: 'usd', order: 'volume_desc', per_page: 50, page: 1, sparkline: false },
+        timeout: 10000,
+      });
+      const markets = resp.data || [];
+      for (const coin of markets) {
+        const sym = coin.symbol?.toUpperCase();
+        if (sym && !symbols.includes(sym)) symbols.push(sym);
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] CoinGecko markets fetch failed: ${err.message}`);
+    }
+
+    if (symbols.length > 0) {
+      this.cmcCache = { symbols, ts: Date.now() };
+    }
+    return symbols;
+  }
+
+  // ---- Fetch detailed market data from CoinMarketCap ----
+  private async fetchCMCMarketData(symbols: string[]): Promise<Map<string, {
+    marketCap: number; volume24h: number; priceChange24h: number;
+    priceChange7d: number; dominance: number; rank: number;
+    circulatingSupply: number; maxSupply: number | null;
+  }>> {
+    const result = new Map<string, any>();
+    if (!CMC_API_KEY || symbols.length === 0) return result;
+
+    try {
+      const resp = await axios.get(`${CMC_BASE}/cryptocurrency/quotes/latest`, {
+        headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
+        params: { symbol: symbols.slice(0, 50).join(','), convert: 'USD' },
+        timeout: 10000,
+      });
+      const data = resp.data?.data || {};
+      for (const sym of symbols) {
+        const coin = data[sym]?.[0] || data[sym];
+        if (!coin) continue;
+        const quote = coin.quote?.USD;
+        if (!quote) continue;
+        result.set(sym, {
+          marketCap: quote.market_cap || 0,
+          volume24h: quote.volume_24h || 0,
+          priceChange24h: quote.percent_change_24h || 0,
+          priceChange7d: quote.percent_change_7d || 0,
+          dominance: quote.market_cap_dominance || 0,
+          rank: coin.cmc_rank || 0,
+          circulatingSupply: coin.circulating_supply || 0,
+          maxSupply: coin.max_supply || null,
+        });
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] CMC quotes fetch failed: ${err.message}`);
+    }
+    return result;
+  }
+  private newsCache: Map<string, { sentiment: string; headline?: string; source?: string; ts: number }> = new Map();
+
+  async fetchNewsSentiment(symbols: string[]): Promise<Map<string, { sentiment: string; headline?: string; source?: string }>> {
+    const result = new Map<string, { sentiment: string; headline?: string; source?: string }>();
+    const now = Date.now();
+
+    // Check cache (5 min TTL)
+    const uncached: string[] = [];
+    for (const s of symbols) {
+      const cached = this.newsCache.get(s);
+      if (cached && now - cached.ts < 300000) {
+        result.set(s, { sentiment: cached.sentiment, headline: cached.headline, source: cached.source });
+      } else {
+        uncached.push(s);
+      }
+    }
+
+    if (uncached.length === 0) return result;
+
+    try {
+      // Use CryptoCompare news (free, no key needed)
+      const resp = await axios.get('https://min-api.cryptocompare.com/data/v2/news/', {
+        params: { lang: 'EN', categories: uncached.join(',') },
+        timeout: 10000,
+      });
+
+      const articles = resp.data?.Data || [];
+      for (const s of uncached) {
+        const sym = s.toLowerCase();
+        const relevant = articles.filter((a: any) =>
+          a.title?.toLowerCase().includes(sym) ||
+          a.categories?.toLowerCase().includes(sym) ||
+          a.body?.toLowerCase().includes(sym)
+        );
+
+        if (relevant.length > 0) {
+          const article = relevant[0];
+          // Simple sentiment from title keywords
+          const title = (article.title || '').toLowerCase();
+          let sentiment: 'bullish' | 'bearish' | 'neutral' = 'neutral';
+          const bullishWords = ['surge', 'rally', 'bullish', 'pump', 'soar', 'rise', 'gain', 'high', 'breakout', 'buy', 'upside', 'moon', 'ath', 'record'];
+          const bearishWords = ['crash', 'dump', 'bearish', 'fall', 'drop', 'plunge', 'sell', 'down', 'low', 'correction', 'decline', 'fear'];
+
+          const bullCount = bullishWords.filter(w => title.includes(w)).length;
+          const bearCount = bearishWords.filter(w => title.includes(w)).length;
+          if (bullCount > bearCount) sentiment = 'bullish';
+          else if (bearCount > bullCount) sentiment = 'bearish';
+
+          const entry = { sentiment, headline: article.title, source: article.source };
+          result.set(s, entry);
+          this.newsCache.set(s, { ...entry, ts: now });
+        } else {
+          result.set(s, { sentiment: 'neutral' });
+          this.newsCache.set(s, { sentiment: 'neutral', ts: now });
+        }
+      }
+    } catch (err: any) {
+      logger.debug(`[FUTURES] News fetch failed: ${err.message}`);
+      for (const s of uncached) {
+        result.set(s, { sentiment: 'neutral' });
+      }
+    }
+
+    return result;
+  }
+
+  // ---- Compute technicals from OHLCV data ----
+  private computeFuturesTechnicals(candles: number[][]): {
+    rsi: number;
+    macdSignal: 'bullish' | 'bearish' | 'neutral';
+    ema20: number;
+    ema50: number;
+    bollingerPosition: 'upper' | 'middle' | 'lower';
+    trend: 'uptrend' | 'downtrend' | 'sideways';
+    atr: number;
+    currentPrice: number;
+  } | null {
+    if (candles.length < 50) return null;
+
+    const closes = candles.map(c => c[4]);
+    const highs = candles.map(c => c[2]);
+    const lows = candles.map(c => c[3]);
+    const currentPrice = closes[closes.length - 1];
+
+    // RSI
+    const rsiValues = RSI.calculate({ values: closes, period: 14 });
+    const rsi = rsiValues[rsiValues.length - 1] || 50;
+
+    // MACD
+    const macdResult = MACD.calculate({
+      values: closes, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9,
+      SimpleMAOscillator: false, SimpleMASignal: false,
+    });
+    const lastMacd = macdResult[macdResult.length - 1];
+    const macdSignal: 'bullish' | 'bearish' | 'neutral' =
+      lastMacd?.histogram !== undefined
+        ? lastMacd.histogram > 0 ? 'bullish' : 'bearish'
+        : 'neutral';
+
+    // EMA
+    const ema20Values = EMA.calculate({ values: closes, period: 20 });
+    const ema50Values = EMA.calculate({ values: closes, period: 50 });
+    const ema20 = ema20Values[ema20Values.length - 1] || 0;
+    const ema50 = ema50Values[ema50Values.length - 1] || 0;
+
+    // Bollinger Bands
+    const bbResult = BollingerBands.calculate({ values: closes, period: 20, stdDev: 2 });
+    const lastBB = bbResult[bbResult.length - 1];
+    let bollingerPosition: 'upper' | 'middle' | 'lower' = 'middle';
+    if (lastBB) {
+      if (currentPrice >= lastBB.upper) bollingerPosition = 'upper';
+      else if (currentPrice <= lastBB.lower) bollingerPosition = 'lower';
+    }
+
+    // Trend
+    let trend: 'uptrend' | 'downtrend' | 'sideways' = 'sideways';
+    if (ema20 > ema50 && currentPrice > ema20) trend = 'uptrend';
+    else if (ema20 < ema50 && currentPrice < ema20) trend = 'downtrend';
+
+    // ATR (for SL/TP sizing)
+    const atrPeriod = 14;
+    let atrSum = 0;
+    for (let i = candles.length - atrPeriod; i < candles.length; i++) {
+      const tr = Math.max(
+        highs[i] - lows[i],
+        Math.abs(highs[i] - closes[i - 1]),
+        Math.abs(lows[i] - closes[i - 1])
+      );
+      atrSum += tr;
+    }
+    const atr = atrSum / atrPeriod;
+
+    return { rsi, macdSignal, ema20, ema50, bollingerPosition, trend, atr, currentPrice };
+  }
+
+  // ---- Scan exchange futures markets and generate setups ----
+  async scanFuturesMarkets(): Promise<FuturesSetup[]> {
+    const setups: FuturesSetup[] = [];
+
+    // Get symbols to scan
+    let symbols: string[];
+    if (this.isInitialized && this.exchange) {
+      try {
+        const markets = await this.exchange.loadMarkets();
+        symbols = Object.keys(markets)
+          .filter(s => markets[s]?.swap || markets[s]?.future)
+          .filter(s => s.endsWith('/USDT:USDT'))
+          .map(s => s.split('/')[0])
+          .slice(0, 60);
+      } catch {
+        symbols = PerpsTrader.FUTURES_SYMBOLS;
+      }
+    } else {
+      // Use Gate.io public API (no auth needed) for symbol list
+      symbols = await this.fetchExchangeFuturesSymbols();
+    }
+
+    // Merge with CMC/CoinGecko trending coins for broader coverage
+    try {
+      const trendingSymbols = await this.fetchCMCTrendingSymbols();
+      // Only add trending symbols that are also available on Gate.io futures
+      const gateSymbols = new Set(symbols.map(s => s.toUpperCase()));
+      for (const sym of trendingSymbols) {
+        if (!gateSymbols.has(sym.toUpperCase())) {
+          symbols.push(sym);
+        }
+      }
+    } catch {}
+
+    // Deduplicate
+    symbols = [...new Set(symbols.map(s => s.toUpperCase()))];
+
+    logger.info(`[FUTURES] Scanning ${symbols.length} exchange perps markets (incl. trending)...`);
+
+    for (const symbol of symbols.slice(0, 50)) {
+      try {
+        // Fetch OHLCV — from connected exchange or Gate.io/CryptoCompare
+        let candles: number[][];
+        if (this.isInitialized && this.exchange) {
+          const raw = await this.exchange.fetchOHLCV(`${symbol}/USDT:USDT`, '15m', undefined, 100);
+          candles = raw.map((c: any) => c.map((v: any) => Number(v || 0)));
+        } else {
+          candles = await this.fetchFuturesOHLCV(symbol, 100);
+        }
+
+        if (candles.length < 50) continue;
+
+        const tech = this.computeFuturesTechnicals(candles);
+        if (!tech) continue;
+
+        // Generate setup based on technicals
+        const setup = this.evaluateFuturesSetup(symbol, tech);
+        if (setup) {
+          setups.push(setup);
+        }
+      } catch (err: any) {
+        logger.debug(`[FUTURES] Skip ${symbol}: ${err.message}`);
+      }
+    }
+
+    setups.sort((a, b) => b.confidence - a.confidence);
+
+    // Enrich with news sentiment, CoinGecko data, CMC data, and exchange availability
+    const setupSymbols = setups.map(s => s.symbol);
+    const [newsData, cgData, cmcData] = await Promise.all([
+      this.fetchNewsSentiment(setupSymbols),
+      this.fetchCoinGeckoData(setupSymbols),
+      this.fetchCMCMarketData(setupSymbols),
+    ]);
+
+    for (const setup of setups) {
+      // News sentiment
+      const news = newsData.get(setup.symbol);
+      if (news) {
+        setup.news = {
+          sentiment: news.sentiment as any,
+          headline: news.headline,
+          source: news.source,
+        };
+        // Boost confidence if news aligns with direction
+        if ((news.sentiment === 'bullish' && setup.direction === 'LONG') ||
+            (news.sentiment === 'bearish' && setup.direction === 'SHORT')) {
+          setup.confidence = Math.min(setup.confidence + 10, 100);
+          setup.reason += ' | News confirms direction';
+        } else if ((news.sentiment === 'bearish' && setup.direction === 'LONG') ||
+                   (news.sentiment === 'bullish' && setup.direction === 'SHORT')) {
+          setup.confidence = Math.max(setup.confidence - 5, 0);
+          setup.reason += ' | News contradicts direction';
+        }
+      }
+
+      // CoinGecko market data
+      const cg = cgData.get(setup.symbol);
+      if (cg) {
+        setup.marketCap = cg.marketCap;
+        setup.volume24h = cg.volume24h;
+        setup.priceChange24h = cg.priceChange24h;
+      }
+
+      // CoinMarketCap enrichment (overrides CoinGecko if available - more accurate)
+      const cmc = cmcData.get(setup.symbol);
+      if (cmc) {
+        setup.marketCap = cmc.marketCap || setup.marketCap;
+        setup.volume24h = cmc.volume24h || setup.volume24h;
+        setup.priceChange24h = cmc.priceChange24h || setup.priceChange24h;
+        setup.priceChange7d = cmc.priceChange7d;
+        setup.cmcRank = cmc.rank;
+        setup.circulatingSupply = cmc.circulatingSupply;
+        setup.maxSupply = cmc.maxSupply;
+      }
+
+      // Exchange availability
+      setup.exchanges = this.getExchangesForSymbol(setup.symbol);
+
+      // Detailed analysis summary
+      setup.analysisDetail = this.buildAnalysisDetail(setup);
+    }
+
+    // Re-sort after confidence adjustments
+    setups.sort((a, b) => b.confidence - a.confidence);
+    this.futuresSetups = setups;
+    logger.info(`[FUTURES] Generated ${setups.length} setups from exchange perps`);
+    return setups;
+  }
+
+  // ---- Build a detailed analysis summary for each setup ----
+  private buildAnalysisDetail(setup: FuturesSetup): string {
+    const parts: string[] = [];
+    const t = setup.technicals;
+
+    // RSI analysis
+    if (t.rsi < 30) parts.push(`RSI at ${t.rsi.toFixed(1)} indicates heavily oversold conditions — potential reversal zone`);
+    else if (t.rsi > 70) parts.push(`RSI at ${t.rsi.toFixed(1)} signals overbought — watch for correction`);
+    else if (t.rsi < 40) parts.push(`RSI ${t.rsi.toFixed(1)} approaching oversold territory`);
+    else if (t.rsi > 60) parts.push(`RSI ${t.rsi.toFixed(1)} leaning overbought`);
+    else parts.push(`RSI at ${t.rsi.toFixed(1)} — neutral zone`);
+
+    // MACD analysis
+    if (t.macd === 'bullish') parts.push('MACD histogram positive with bullish crossover — momentum favors longs');
+    else if (t.macd === 'bearish') parts.push('MACD histogram negative with bearish crossover — momentum favors shorts');
+    else parts.push('MACD flat — no clear momentum signal');
+
+    // Trend
+    if (t.trend === 'uptrend') parts.push(`Price above EMA20 ($${t.ema20.toFixed(4)}) & EMA50 ($${t.ema50.toFixed(4)}) — confirmed uptrend`);
+    else if (t.trend === 'downtrend') parts.push(`Price below EMA20 ($${t.ema20.toFixed(4)}) & EMA50 ($${t.ema50.toFixed(4)}) — confirmed downtrend`);
+    else parts.push(`EMAs converging — sideways/range-bound market`);
+
+    // Bollinger
+    if (t.bollinger === 'lower') parts.push('Trading near lower Bollinger Band — potential mean reversion bounce');
+    else if (t.bollinger === 'upper') parts.push('Testing upper Bollinger Band — potential resistance/pullback');
+
+    // Market data
+    if (setup.marketCap) parts.push(`Market Cap: $${(setup.marketCap / 1e6).toFixed(1)}M`);
+    if (setup.volume24h) parts.push(`24h Volume: $${(setup.volume24h / 1e6).toFixed(1)}M`);
+    if (setup.priceChange24h) parts.push(`24h Change: ${setup.priceChange24h > 0 ? '+' : ''}${setup.priceChange24h.toFixed(2)}%`);
+    if (setup.priceChange7d) parts.push(`7d Change: ${setup.priceChange7d > 0 ? '+' : ''}${setup.priceChange7d.toFixed(2)}%`);
+
+    // Risk/Reward
+    parts.push(`Risk/Reward: ${setup.riskReward.toFixed(1)}:1 — SL ${((Math.abs(setup.entry - setup.stopLoss) / setup.entry) * 100).toFixed(2)}% from entry`);
+
+    // News
+    if (setup.news?.headline) {
+      parts.push(`Latest News (${setup.news.sentiment}): "${setup.news.headline}"`);
+    }
+
+    return parts.join('. ');
+  }
+
+  // ---- Evaluate a futures setup from technicals ----
+  private evaluateFuturesSetup(
+    symbol: string,
+    tech: NonNullable<ReturnType<PerpsTrader['computeFuturesTechnicals']>>
+  ): FuturesSetup | null {
+    let confidence = 0;
+    let direction: 'LONG' | 'SHORT' = 'LONG';
+    const reasons: string[] = [];
+
+    // RSI signals
+    if (tech.rsi < 30) {
+      confidence += 25;
+      direction = 'LONG';
+      reasons.push(`RSI oversold (${tech.rsi.toFixed(1)})`);
+    } else if (tech.rsi > 70) {
+      confidence += 25;
+      direction = 'SHORT';
+      reasons.push(`RSI overbought (${tech.rsi.toFixed(1)})`);
+    } else if (tech.rsi < 40) {
+      confidence += 10;
+      direction = 'LONG';
+      reasons.push(`RSI approaching oversold (${tech.rsi.toFixed(1)})`);
+    } else if (tech.rsi > 60) {
+      confidence += 10;
+      direction = 'SHORT';
+      reasons.push(`RSI approaching overbought (${tech.rsi.toFixed(1)})`);
+    }
+
+    // MACD
+    if (tech.macdSignal === 'bullish') {
+      confidence += 20;
+      if (direction === 'LONG') reasons.push('MACD bullish');
+      else { direction = 'LONG'; reasons.push('MACD bullish crossover'); }
+    } else if (tech.macdSignal === 'bearish') {
+      confidence += 20;
+      if (direction === 'SHORT') reasons.push('MACD bearish');
+      else { direction = 'SHORT'; reasons.push('MACD bearish crossover'); }
+    }
+
+    // Trend alignment
+    if (tech.trend === 'uptrend' && direction === 'LONG') {
+      confidence += 15;
+      reasons.push('Uptrend confirmed');
+    } else if (tech.trend === 'downtrend' && direction === 'SHORT') {
+      confidence += 15;
+      reasons.push('Downtrend confirmed');
+    } else if (tech.trend !== 'sideways' && 
+      ((tech.trend === 'uptrend' && direction === 'SHORT') || 
+       (tech.trend === 'downtrend' && direction === 'LONG'))) {
+      confidence -= 10;
+      reasons.push('Counter-trend');
+    }
+
+    // Bollinger band extremes
+    if (tech.bollingerPosition === 'lower' && direction === 'LONG') {
+      confidence += 15;
+      reasons.push('At Bollinger lower band');
+    } else if (tech.bollingerPosition === 'upper' && direction === 'SHORT') {
+      confidence += 15;
+      reasons.push('At Bollinger upper band');
+    }
+
+    // EMA proximity (mean reversion)
+    const ema20Dist = Math.abs(tech.currentPrice - tech.ema20) / tech.currentPrice * 100;
+    if (ema20Dist > 3) {
+      confidence += 5;
+      reasons.push(`Price ${ema20Dist.toFixed(1)}% from EMA20`);
+    }
+
+    // Minimum threshold — only show actionable setups
+    if (confidence < 30) return null;
+
+    // Calculate SL/TP using ATR
+    const atrMultSL = 1.5;
+    const atrMultTP = 3.0;
+    const entry = tech.currentPrice;
+    const sl = direction === 'LONG'
+      ? entry - tech.atr * atrMultSL
+      : entry + tech.atr * atrMultSL;
+    const tp = direction === 'LONG'
+      ? entry + tech.atr * atrMultTP
+      : entry - tech.atr * atrMultTP;
+
+    const riskAmt = Math.abs(entry - sl);
+    const rewardAmt = Math.abs(tp - entry);
+    const riskReward = riskAmt > 0 ? rewardAmt / riskAmt : 0;
+
+    return {
+      id: v4Fallback(),
+      symbol,
+      pair: `${symbol}/USDT`,
+      exchange: this.isInitialized ? config.exchange.id : 'Gate.io',
+      direction,
+      entry,
+      stopLoss: sl,
+      takeProfit: tp,
+      confidence: Math.min(confidence, 100),
+      leverage: config.trading.defaultLeverage,
+      reason: reasons.join(' | '),
+      riskReward,
+      technicals: {
+        rsi: tech.rsi,
+        macd: tech.macdSignal,
+        trend: tech.trend,
+        ema20: tech.ema20,
+        ema50: tech.ema50,
+        bollinger: tech.bollingerPosition,
+      },
+      exchanges: this.getExchangesForSymbol(symbol),
+      timestamp: Date.now(),
+    };
+  }
+
+  getFuturesSetups(): FuturesSetup[] {
+    return this.futuresSetups;
+  }
+}
+
+// ---- Type for futures trading setups ----
+export interface FuturesSetup {
+  id: string;
+  symbol: string;
+  pair: string;
+  exchange: string;
+  direction: 'LONG' | 'SHORT';
+  entry: number;
+  stopLoss: number;
+  takeProfit: number;
+  confidence: number;
+  leverage: number;
+  reason: string;
+  riskReward: number;
+  technicals: {
+    rsi: number;
+    macd: 'bullish' | 'bearish' | 'neutral';
+    trend: 'uptrend' | 'downtrend' | 'sideways';
+    ema20: number;
+    ema50: number;
+    bollinger: 'upper' | 'middle' | 'lower';
+  };
+  news?: {
+    sentiment: 'bullish' | 'bearish' | 'neutral';
+    headline?: string;
+    source?: string;
+  };
+  marketCap?: number;
+  volume24h?: number;
+  priceChange24h?: number;
+  priceChange7d?: number;
+  cmcRank?: number;
+  circulatingSupply?: number;
+  maxSupply?: number | null;
+  analysisDetail?: string;
+  exchanges: string[];
+  timestamp: number;
+}

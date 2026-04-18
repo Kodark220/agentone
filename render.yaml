@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: token-analyser-agent
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npx tsc
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3001"
