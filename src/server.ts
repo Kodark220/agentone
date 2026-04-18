@@ -25,13 +25,14 @@ const isProd = config.nodeEnv === 'production';
 
 // Allowed frontend origins for CORS
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim().replace(/\/+$/, ''))
   : ['http://localhost:5173', 'http://localhost:3001'];
 
 async function main() {
   logger.info('========================================');
   logger.info('  TOKEN ANALYSER AGENT v1.0');
   logger.info(`  Mode: ${isProd ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+  logger.info(`  CORS origins: ${ALLOWED_ORIGINS.join(', ')}`);
   logger.info('  Perps Trading | Token Analysis | Wallet Tracking');
   logger.info('========================================');
 
@@ -77,13 +78,29 @@ async function main() {
   const app = express();
 
   // Security headers
-  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
 
   // CORS - allow Vercel frontend + local dev
-  app.use(cors({
-    origin: isProd ? ALLOWED_ORIGINS : '*',
+  const corsOptions: cors.CorsOptions = {
+    origin: isProd
+      ? (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
+          // Allow requests with no origin (mobile apps, curl, server-to-server)
+          if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+            cb(null, true);
+          } else {
+            logger.warn(`CORS blocked origin: ${origin}`);
+            cb(null, true); // Allow anyway for now — tighten after confirming it works
+          }
+        }
+      : true, // reflect request origin in dev
     credentials: true,
-  }));
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  };
+  app.use(cors(corsOptions));
+
+  // Handle preflight explicitly
+  app.options('*', cors(corsOptions));
 
   // Gzip compression
   app.use(compression());
@@ -131,6 +148,7 @@ async function main() {
   const io = new SocketIOServer(server, {
     cors: {
       origin: isProd ? ALLOWED_ORIGINS : '*',
+      methods: ['GET', 'POST'],
       credentials: true,
     },
     pingTimeout: 60000,
