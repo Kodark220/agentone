@@ -19,6 +19,7 @@ import { SolanaWalletTracker } from './services/walletTracker';
 import { PerpsTrader } from './services/perpsTrader';
 import { SignalAggregator } from './services/signalAggregator';
 import { SolTrenchesService } from './services/solTrenches';
+import { MarketContextCoordinator } from './services/marketContext';
 import { createRouter } from './routes/api';
 
 const isProd = config.nodeEnv === 'production';
@@ -42,6 +43,7 @@ async function main() {
   const walletTracker = new SolanaWalletTracker();
   const perpsTrader = new PerpsTrader();
   const solTrenches = new SolTrenchesService();
+  const marketContext = new MarketContextCoordinator();
 
   // Cross-link services: token analyser uses news for enrichment
   tokenAnalyser.setNewsEngine(newsEngine);
@@ -120,7 +122,15 @@ async function main() {
   app.set('trust proxy', 1);
 
   // API routes
-  const apiRouter = createRouter(tokenAnalyser, newsEngine, walletTracker, perpsTrader, signalAggregator, solTrenches);
+  const apiRouter = createRouter(
+    tokenAnalyser,
+    newsEngine,
+    walletTracker,
+    perpsTrader,
+    signalAggregator,
+    solTrenches,
+    marketContext
+  );
   app.use('/api', apiRouter);
 
   // Health check
@@ -164,6 +174,7 @@ async function main() {
       watchlist: tokenAnalyser.getWatchlist(),
       wallets: walletTracker.getTrackedWallets(),
       autoTrade: signalAggregator.isAutoTradeEnabled(),
+      marketContext: marketContext.getContext(),
     });
 
     socket.on('disconnect', () => {
@@ -213,6 +224,16 @@ async function main() {
     }
   });
 
+  // Refresh global market context every minute
+  cron.schedule('* * * * *', async () => {
+    try {
+      const context = await marketContext.refresh(perpsTrader, solTrenches);
+      io.emit('marketContext', context);
+    } catch (err: any) {
+      logger.error(`[CRON] Market context refresh failed: ${err.message}`);
+    }
+  });
+
   // Poll wallets every 2 minutes (fallback for WebSocket)
   cron.schedule('*/2 * * * *', async () => {
     if (walletTracker.getTrackedWallets().length > 0) {
@@ -229,6 +250,14 @@ async function main() {
     logger.info(`API: http://localhost:${config.port}/api/status`);
     logger.info(`Env: ${config.nodeEnv} | Exchange: ${config.exchange.id} | Sandbox: ${config.exchange.sandbox}`);
   });
+
+  // Prime market context once on startup
+  try {
+    const context = await marketContext.refresh(perpsTrader, solTrenches);
+    io.emit('marketContext', context);
+  } catch (err: any) {
+    logger.warn(`[INIT] Market context prime failed: ${err.message}`);
+  }
 
   // ---- Graceful Shutdown ----
   const shutdown = (signal: string) => {

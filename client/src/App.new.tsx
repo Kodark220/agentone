@@ -52,6 +52,7 @@ export default function App() {
   const [pumpCandidates, setPumpCandidates] = useState<any[]>([]);
   const [flowSummary, setFlowSummary] = useState<any>(null);
   const [expandedSetup, setExpandedSetup] = useState<string | null>(null);
+  const [marketContext, setMarketContext] = useState<any>(null);
 
   // Detail modal state
   const [detailModal, setDetailModal] = useState<{ type: 'futures' | 'trench'; data: any } | null>(null);
@@ -67,9 +68,9 @@ export default function App() {
   // ---- Data Loading ----
   const refresh = useCallback(async () => {
     try {
-      const [s, sig, pos, wl, wal, n, ft, tr] = await Promise.all([
+      const [s, sig, pos, wl, wal, n, ft, tr, mc] = await Promise.all([
         api.getStatus(), api.getSignals(), api.getPositions(), api.getWatchlist(),
-        api.getWallets(), api.getNews(), api.getFuturesSetups(), api.getTrenches(),
+        api.getWallets(), api.getNews(), api.getFuturesSetups(), api.getTrenches(), api.getMarketContext(),
       ]);
       setStatus(s);
       setSignals(sig.recent || []);
@@ -88,6 +89,7 @@ export default function App() {
       setPumpCandidates(tr.pumpCandidates || []);
       setFlowSummary(tr.flowSummary || null);
       setTrenchesLastUpdate(Date.now());
+      setMarketContext(mc.context || null);
     } catch (err) { console.error('Failed to load:', err); }
   }, []);
 
@@ -117,9 +119,11 @@ export default function App() {
       setAggregated(s.signals || []); setPositions(s.positions || []);
       setWatchlist(s.watchlist || []); setWallets(s.wallets || []);
       setAutoTrade(s.autoTrade || false);
+      setMarketContext(s.marketContext || null);
     });
     socket.on('trenchesUpdate', (t: any[]) => { setTrenchTokens(t); setTrenchesLastUpdate(Date.now()); });
     socket.on('futuresSetups', (s: any[]) => { setFuturesSetups(s); setFuturesLastUpdate(Date.now()); });
+    socket.on('marketContext', (ctx: any) => setMarketContext(ctx));
     return () => { socket.disconnect(); };
   }, []);
 
@@ -219,6 +223,10 @@ export default function App() {
   const flowColor = (flow: string) => flow === 'accumulating' ? 'text-emerald-400' : flow === 'distributing' ? 'text-red-400' : 'text-zinc-400';
   const pumpScoreColor = (s: number) => s >= 60 ? 'text-emerald-400' : s >= 40 ? 'text-amber-400' : s >= 20 ? 'text-blue-400' : 'text-zinc-500';
   const pumpScoreBg = (s: number) => s >= 60 ? 'bg-emerald-500' : s >= 40 ? 'bg-amber-500' : s >= 20 ? 'bg-blue-500' : 'bg-zinc-600';
+  const marketModeBg = (m: string) => m === 'RISK_ON' ? 'bg-emerald-500/15 border-emerald-500/30' : 'bg-red-500/15 border-red-500/30';
+  const marketModeText = (m: string) => m === 'RISK_ON' ? 'text-emerald-400' : 'text-red-400';
+  const trendText = (t: string) => t === 'bullish' ? 'text-emerald-400' : t === 'bearish' ? 'text-red-400' : 'text-amber-400';
+  const domText = (t: string) => t === 'falling' ? 'text-emerald-400' : t === 'rising' ? 'text-red-400' : 'text-zinc-400';
 
   // ============================================
   // RENDER
@@ -260,6 +268,73 @@ export default function App() {
       </motion.header>
 
       <main className="max-w-[1480px] mx-auto px-5 py-5 space-y-5">
+        {/* ---- GLOBAL MARKET CONTEXT ---- */}
+        {marketContext && (
+          <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+            <Card className="border-border/50 bg-card/50">
+              <CardContent className="p-4">
+                <div className="flex flex-wrap items-center gap-3 justify-between">
+                  <div className="flex items-center gap-4 flex-wrap">
+                    <div>
+                      <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">BTC Trend</span>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        {marketContext.btcTrend === 'bullish' ? <TrendingUp className="w-3.5 h-3.5 text-emerald-400" /> : marketContext.btcTrend === 'bearish' ? <TrendingDown className="w-3.5 h-3.5 text-red-400" /> : <Activity className="w-3.5 h-3.5 text-amber-400" />}
+                        <span className={cn('text-sm font-bold uppercase', trendText(marketContext.btcTrend))}>{marketContext.btcTrend}</span>
+                        <span className="text-xs text-muted-foreground tabular-nums">{formatPrice(marketContext.btcPrice)} ({marketContext.btcChange24h > 0 ? '+' : ''}{marketContext.btcChange24h?.toFixed(2)}%)</span>
+                      </div>
+                    </div>
+
+                    <div className={cn('rounded-md border px-3 py-2', marketModeBg(marketContext.marketMode))}>
+                      <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Market Mode</span>
+                      <div className={cn('text-sm font-bold mt-0.5', marketModeText(marketContext.marketMode))}>
+                        {marketContext.marketMode === 'RISK_ON' ? 'RISK ON' : 'RISK OFF'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">BTC Dominance</span>
+                      <div className="mt-0.5 text-sm font-bold">
+                        <span className="tabular-nums">{(marketContext.btcDominance || 0).toFixed(1)}%</span>
+                        <span className={cn('ml-1 uppercase text-xs', domText(marketContext.btcDominanceTrend))}>{marketContext.btcDominanceTrend}</span>
+                      </div>
+                    </div>
+
+                    <div>
+                      <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">Volatility</span>
+                      <div className={cn('mt-0.5 text-sm font-bold uppercase', marketContext.volatilityState === 'extreme' ? 'text-red-400' : marketContext.volatilityState === 'elevated' ? 'text-amber-400' : 'text-emerald-400')}>
+                        {marketContext.volatilityState}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="text-right">
+                    <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">Risk Score</span>
+                    <div className="flex items-center gap-2 justify-end mt-0.5">
+                      <span className={cn('text-sm font-bold tabular-nums', marketContext.riskScore >= 60 ? 'text-emerald-400' : marketContext.riskScore <= 40 ? 'text-red-400' : 'text-amber-400')}>
+                        {marketContext.riskScore}/100
+                      </span>
+                      <div className="w-24 h-1.5 rounded-full bg-muted overflow-hidden">
+                        <div className={cn('h-full rounded-full', marketContext.riskScore >= 60 ? 'bg-emerald-500' : marketContext.riskScore <= 40 ? 'bg-red-500' : 'bg-amber-500')} style={{ width: `${marketContext.riskScore}%` }} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {marketContext.warnings?.length > 0 && (
+                  <div className="mt-3 rounded-md border border-amber-500/20 bg-amber-500/5 p-2.5">
+                    <div className="text-[10px] uppercase tracking-wider text-amber-400 font-semibold mb-1">Risk Warnings</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {marketContext.warnings.map((w: string, i: number) => (
+                        <Badge key={i} variant="warning" className="text-[10px]">{w}</Badge>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+
         {/* ---- STAT CARDS ---- */}
         <motion.div initial="initial" animate="animate" variants={staggerContainer} className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
           {[

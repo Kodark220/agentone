@@ -10,6 +10,7 @@ import { SolanaWalletTracker } from '../services/walletTracker';
 import { PerpsTrader } from '../services/perpsTrader';
 import { SignalAggregator } from '../services/signalAggregator';
 import { SolTrenchesService } from '../services/solTrenches';
+import { MarketContextCoordinator } from '../services/marketContext';
 import { Chain } from '../types';
 import { logger } from '../utils/logger';
 
@@ -19,7 +20,8 @@ export function createRouter(
   walletTracker: SolanaWalletTracker,
   perpsTrader: PerpsTrader,
   signalAggregator: SignalAggregator,
-  solTrenches: SolTrenchesService
+  solTrenches: SolTrenchesService,
+  marketContext: MarketContextCoordinator
 ): Router {
   const router = Router();
 
@@ -171,6 +173,11 @@ export function createRouter(
   router.get('/markets', async (_req: Request, res: Response) => {
     const markets = await perpsTrader.getAvailableMarkets();
     res.json({ markets: markets.slice(0, 200) });
+  });
+
+  // ---- Global Market Context ----
+  router.get('/context/market', (_req: Request, res: Response) => {
+    res.json({ context: marketContext.getContext() });
   });
 
   // ---- Futures Trading Setups ----

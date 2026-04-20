@@ -54,6 +54,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ enabled }),
     }),
+  getMarketContext: () => fetchJSON('/context/market'),
 
   // Futures setups
   getFuturesSetups: () => fetchJSON('/futures/setups'),
