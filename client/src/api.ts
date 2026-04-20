@@ -55,6 +55,8 @@ export const api = {
       body: JSON.stringify({ enabled }),
     }),
   getMarketContext: () => fetchJSON('/context/market'),
+  getHunterOpportunities: () => fetchJSON('/hunter/opportunities'),
+  getStrategistSetups: () => fetchJSON('/strategist/setups'),
 
   // Futures setups
   getFuturesSetups: () => fetchJSON('/futures/setups'),

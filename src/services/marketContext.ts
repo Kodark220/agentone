@@ -27,6 +27,11 @@ export interface MarketContext {
     accumulating: number;
     distributing: number;
     pumpCandidates: number;
+    highRiskTokens: number;
+  };
+  futuresSafety: {
+    highRiskSetups: number;
+    blockedSetups: number;
   };
   warnings: string[];
   lastUpdated: number;
@@ -43,7 +48,8 @@ export class MarketContextCoordinator {
     volatilityState: 'normal',
     riskScore: 50,
     futuresBias: { longCount: 0, shortCount: 0, avgConfidence: 0 },
-    tokenFlow: { totalNetFlow: 0, accumulating: 0, distributing: 0, pumpCandidates: 0 },
+    tokenFlow: { totalNetFlow: 0, accumulating: 0, distributing: 0, pumpCandidates: 0, highRiskTokens: 0 },
+    futuresSafety: { highRiskSetups: 0, blockedSetups: 0 },
     warnings: [],
     lastUpdated: 0,
   };
@@ -65,6 +71,9 @@ export class MarketContextCoordinator {
 
     const flow = solTrenches.getFundFlowSummary();
     const pumpCandidates = solTrenches.getPumpCandidates().length;
+    const highRiskTokens = solTrenches.getTrackedTokens().filter(t => t.safety?.riskLevel === 'HIGH').length;
+    const highRiskSetups = setups.filter(s => s.safety?.level === 'high').length;
+    const blockedSetups = setups.filter(s => s.safety?.blocked).length;
 
     const btcTrend: TrendState = btcData.change24h > 1.5
       ? 'bullish'
@@ -107,6 +116,8 @@ export class MarketContextCoordinator {
 
     if (avgConfidence >= 70) riskScore += 4;
     if (avgConfidence <= 45 && setups.length > 0) riskScore -= 4;
+    if (highRiskTokens > Math.max(3, pumpCandidates)) riskScore -= 6;
+    if (highRiskSetups > Math.max(2, Math.floor(setups.length * 0.25))) riskScore -= 5;
 
     riskScore = Math.max(0, Math.min(100, riskScore));
     const marketMode: MarketMode = riskScore >= 55 ? 'RISK_ON' : 'RISK_OFF';
@@ -115,6 +126,12 @@ export class MarketContextCoordinator {
     if (volatilityState === 'extreme') warnings.push('Extreme BTC volatility detected');
     if ((flow.distributing || 0) > (flow.accumulating || 0)) warnings.push('Token flow shows broad distribution');
     if (btcTrend === 'bearish' && shortCount > longCount) warnings.push('Bearish structure dominates futures setups');
+    if (highRiskTokens > Math.max(3, pumpCandidates)) warnings.push('Elevated rug/fake-volume risk in token flow');
+    if (blockedSetups > 0) warnings.push(`${blockedSetups} futures setups blocked by safety guard`);
+
+    // Push shared risk mode into both engines.
+    perpsTrader.setMarketMode(marketMode);
+    solTrenches.setMarketMode(marketMode);
 
     this.context = {
       btcPrice: btcData.price,
@@ -131,6 +148,11 @@ export class MarketContextCoordinator {
         accumulating: flow.accumulating || 0,
         distributing: flow.distributing || 0,
         pumpCandidates,
+        highRiskTokens,
+      },
+      futuresSafety: {
+        highRiskSetups,
+        blockedSetups,
       },
       warnings,
       lastUpdated: Date.now(),

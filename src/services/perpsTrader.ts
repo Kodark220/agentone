@@ -14,11 +14,22 @@ import { v4Fallback } from '../utils/id';
 
 const CMC_API_KEY = process.env.CMC_API_KEY || '';
 const CMC_BASE = 'https://pro-api.coinmarketcap.com/v1';
+type RiskMode = 'RISK_ON' | 'RISK_OFF';
 
 export class PerpsTrader {
   private exchange: Exchange | null = null;
   private positions: Map<string, Position> = new Map();
   private isInitialized = false;
+  private marketMode: RiskMode = 'RISK_OFF';
+  private derivativesCache: Map<string, { data: DerivativesIntel; ts: number }> = new Map();
+
+  setMarketMode(mode: RiskMode) {
+    this.marketMode = mode;
+  }
+
+  getMarketMode(): RiskMode {
+    return this.marketMode;
+  }
 
   // ---- Initialize exchange connection ----
   async initialize(): Promise<boolean> {
@@ -962,13 +973,21 @@ export class PerpsTrader {
 
     setups.sort((a, b) => b.confidence - a.confidence);
 
-    // Enrich with news sentiment, CoinGecko data, CMC data, and exchange availability
+    // Enrich with news sentiment, CoinGecko data, CMC data, derivatives, and exchange availability
     const setupSymbols = setups.map(s => s.symbol);
     const [newsData, cgData, cmcData] = await Promise.all([
       this.fetchNewsSentiment(setupSymbols),
       this.fetchCoinGeckoData(setupSymbols),
       this.fetchCMCMarketData(setupSymbols),
     ]);
+
+    const derivativesPairs = await Promise.all(
+      setups.map(async (s) => [s.symbol, await this.fetchDerivativesIntel(s.symbol)] as const)
+    );
+    const derivativesMap = new Map<string, DerivativesIntel>();
+    for (const [sym, d] of derivativesPairs) {
+      if (d) derivativesMap.set(sym, d);
+    }
 
     for (const setup of setups) {
       // News sentiment
@@ -1018,6 +1037,26 @@ export class PerpsTrader {
         setup.exchanges = this.getExchangesForSymbol(setup.symbol);
       }
 
+      // Derivatives intelligence
+      const derivatives = derivativesMap.get(setup.symbol);
+      if (derivatives) setup.derivatives = derivatives;
+
+      // Market-mode context sharing
+      if (this.marketMode === 'RISK_OFF') {
+        if (setup.direction === 'LONG') {
+          setup.confidence = Math.max(0, setup.confidence - 8);
+          setup.reason += ' | Risk-off mode trims long bias';
+        } else {
+          setup.confidence = Math.min(100, setup.confidence + 4);
+          setup.reason += ' | Risk-off mode supports defensive short';
+        }
+      } else if (setup.direction === 'LONG') {
+        setup.confidence = Math.min(100, setup.confidence + 5);
+        setup.reason += ' | Risk-on mode supports long momentum';
+      }
+
+      this.applyDerivativesAdjustments(setup);
+
       // Detailed analysis summary
       setup.analysisDetail = this.buildAnalysisDetail(setup);
     }
@@ -1064,6 +1103,13 @@ export class PerpsTrader {
     // Risk/Reward
     parts.push(`Risk/Reward: ${setup.riskReward.toFixed(1)}:1 — SL ${((Math.abs(setup.entry - setup.stopLoss) / setup.entry) * 100).toFixed(2)}% from entry`);
 
+    // Derivatives
+    if (setup.derivatives) {
+      parts.push(
+        `Funding ${setup.derivatives.fundingRate.toFixed(4)}% | OI ${setup.derivatives.openInterest.toFixed(0)} (${setup.derivatives.openInterestChange24h >= 0 ? '+' : ''}${setup.derivatives.openInterestChange24h.toFixed(1)}%) | L/S ${setup.derivatives.longShortRatio.toFixed(2)}`
+      );
+    }
+
     // Where to trade
     if (setup.exchanges?.length > 0) {
       parts.push(`Available on: ${setup.exchanges.join(', ')}`);
@@ -1074,7 +1120,113 @@ export class PerpsTrader {
       parts.push(`Latest News (${setup.news.sentiment}): "${setup.news.headline}"`);
     }
 
+    // Safety guard
+    if (setup.safety?.warnings?.length) {
+      parts.push(`Safety: ${setup.safety.warnings.join(' | ')}`);
+    }
+
     return parts.join('. ');
+  }
+
+  private async fetchDerivativesIntel(symbol: string): Promise<DerivativesIntel | null> {
+    const cached = this.derivativesCache.get(symbol);
+    if (cached && Date.now() - cached.ts < 60000) return cached.data;
+
+    try {
+      const pair = `${symbol.toUpperCase()}USDT`;
+      const [fundingResp, oiResp, lsResp] = await Promise.all([
+        axios.get('https://fapi.binance.com/fapi/v1/fundingRate', {
+          params: { symbol: pair, limit: 2 },
+          timeout: 8000,
+        }),
+        axios.get('https://fapi.binance.com/fapi/v1/openInterest', {
+          params: { symbol: pair },
+          timeout: 8000,
+        }),
+        axios.get('https://fapi.binance.com/futures/data/globalLongShortAccountRatio', {
+          params: { symbol: pair, period: '1h', limit: 2 },
+          timeout: 8000,
+        }),
+      ]);
+
+      const fundingRows = fundingResp.data || [];
+      const fundingRate = Number(fundingRows[fundingRows.length - 1]?.fundingRate || 0) * 100;
+
+      const openInterest = Number(oiResp.data?.openInterest || 0);
+
+      const lsRows = lsResp.data || [];
+      const latestLs = Number(lsRows[lsRows.length - 1]?.longShortRatio || 1);
+      const prevLs = Number(lsRows[Math.max(0, lsRows.length - 2)]?.longShortRatio || latestLs || 1);
+      const openInterestChange24h = ((latestLs - prevLs) / (prevLs || 1)) * 100;
+
+      const overleveraged = Math.abs(fundingRate) > 0.04 || latestLs > 2.2 || latestLs < 0.45;
+      const squeezeRisk: 'short_squeeze' | 'long_squeeze' | 'low' =
+        fundingRate < -0.01 && latestLs < 0.9
+          ? 'short_squeeze'
+          : fundingRate > 0.01 && latestLs > 1.3
+            ? 'long_squeeze'
+            : 'low';
+
+      const data: DerivativesIntel = {
+        fundingRate,
+        openInterest,
+        openInterestChange24h,
+        longShortRatio: latestLs,
+        overleveraged,
+        squeezeRisk,
+      };
+      this.derivativesCache.set(symbol, { data, ts: Date.now() });
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  private applyDerivativesAdjustments(setup: FuturesSetup) {
+    const d = setup.derivatives;
+    if (!d) return;
+
+    const warnings: string[] = [];
+
+    if (d.fundingRate > 0.02 && setup.direction === 'SHORT') {
+      setup.confidence = Math.min(100, setup.confidence + 6);
+      setup.reason += ' | Positive funding favors contrarian short';
+    }
+    if (d.fundingRate < -0.02 && setup.direction === 'LONG') {
+      setup.confidence = Math.min(100, setup.confidence + 6);
+      setup.reason += ' | Negative funding favors contrarian long';
+    }
+
+    if (d.longShortRatio > 1.8 && setup.direction === 'LONG') {
+      setup.confidence = Math.max(0, setup.confidence - 8);
+      warnings.push('Long crowding risk');
+    }
+    if (d.longShortRatio < 0.7 && setup.direction === 'SHORT') {
+      setup.confidence = Math.max(0, setup.confidence - 8);
+      warnings.push('Short crowding risk');
+    }
+
+    if (d.overleveraged) {
+      setup.confidence = Math.max(0, setup.confidence - 6);
+      warnings.push('Overleveraged derivatives conditions');
+    }
+
+    const headline = (setup.news?.headline || '').toLowerCase();
+    const eventWords = ['cpi', 'fomc', 'fed', 'sec', 'lawsuit', 'hack', 'liquidation'];
+    if (eventWords.some(w => headline.includes(w))) {
+      setup.confidence = Math.max(0, setup.confidence - 5);
+      warnings.push('Major news-event volatility risk');
+    }
+
+    let level: 'low' | 'medium' | 'high' = 'low';
+    if (warnings.length >= 2 || setup.confidence < 45) level = 'high';
+    else if (warnings.length === 1 || setup.confidence < 60) level = 'medium';
+
+    setup.safety = {
+      level,
+      blocked: level === 'high' && this.marketMode === 'RISK_OFF',
+      warnings,
+    };
   }
 
   // ---- Evaluate a futures setup from technicals ----
@@ -1185,6 +1337,7 @@ export class PerpsTrader {
         ema50: tech.ema50,
         bollinger: tech.bollingerPosition,
       },
+      safety: { level: 'low', blocked: false, warnings: [] },
       exchanges: this.getExchangesForSymbol(symbol),
       timestamp: Date.now(),
     };
@@ -1234,7 +1387,24 @@ export interface FuturesSetup {
   cmcRank?: number;
   circulatingSupply?: number;
   maxSupply?: number | null;
+  derivatives?: DerivativesIntel;
+  safety?: SetupSafety;
   analysisDetail?: string;
   exchanges: string[];
   timestamp: number;
+}
+
+export interface DerivativesIntel {
+  fundingRate: number;
+  openInterest: number;
+  openInterestChange24h: number;
+  longShortRatio: number;
+  overleveraged: boolean;
+  squeezeRisk: 'short_squeeze' | 'long_squeeze' | 'low';
+}
+
+export interface SetupSafety {
+  level: 'low' | 'medium' | 'high';
+  blocked: boolean;
+  warnings: string[];
 }

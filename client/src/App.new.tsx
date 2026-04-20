@@ -227,6 +227,8 @@ export default function App() {
   const marketModeText = (m: string) => m === 'RISK_ON' ? 'text-emerald-400' : 'text-red-400';
   const trendText = (t: string) => t === 'bullish' ? 'text-emerald-400' : t === 'bearish' ? 'text-red-400' : 'text-amber-400';
   const domText = (t: string) => t === 'falling' ? 'text-emerald-400' : t === 'rising' ? 'text-red-400' : 'text-zinc-400';
+  const safetyBadge = (l?: string) => l === 'high' || l === 'HIGH' ? 'destructive' : l === 'medium' || l === 'MEDIUM' ? 'warning' : 'success';
+  const signalBadge = (s?: string) => s === 'EARLY_GEM' ? 'success' : s === 'WATCH' ? 'warning' : 'destructive';
 
   // ============================================
   // RENDER
@@ -303,6 +305,20 @@ export default function App() {
                       <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">Volatility</span>
                       <div className={cn('mt-0.5 text-sm font-bold uppercase', marketContext.volatilityState === 'extreme' ? 'text-red-400' : marketContext.volatilityState === 'elevated' ? 'text-amber-400' : 'text-emerald-400')}>
                         {marketContext.volatilityState}
+                      </div>
+                    </div>
+
+                    <div>
+                      <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">Token Risk</span>
+                      <div className="mt-0.5 text-sm font-bold tabular-nums text-red-400">
+                        {marketContext.tokenFlow?.highRiskTokens || 0} high-risk
+                      </div>
+                    </div>
+
+                    <div>
+                      <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">Futures Blocks</span>
+                      <div className="mt-0.5 text-sm font-bold tabular-nums text-amber-400">
+                        {marketContext.futuresSafety?.blockedSetups || 0} blocked
                       </div>
                     </div>
                   </div>
@@ -481,6 +497,25 @@ export default function App() {
                                   )}
                                 </div>
 
+                                {(s.derivatives || s.safety) && (
+                                  <div className="flex items-center gap-2 flex-wrap text-[10px]">
+                                    {s.derivatives ? (
+                                      <>
+                                        <Badge variant="outline" className="text-[10px]">Funding {s.derivatives.fundingRate?.toFixed(4)}%</Badge>
+                                        <Badge variant="outline" className="text-[10px]">L/S {s.derivatives.longShortRatio?.toFixed(2)}</Badge>
+                                        <Badge variant={s.derivatives.overleveraged ? 'destructive' : 'success'} className="text-[10px]">
+                                          {s.derivatives.overleveraged ? 'Overleveraged' : 'Healthy'}
+                                        </Badge>
+                                      </>
+                                    ) : null}
+                                    {s.safety ? (
+                                      <Badge variant={safetyBadge(s.safety.level)} className="text-[10px]">
+                                        Safety {String(s.safety.level || 'low').toUpperCase()}
+                                      </Badge>
+                                    ) : null}
+                                  </div>
+                                )}
+
                                 {/* News sentiment */}
                                 {s.news?.headline && (
                                   <div className="flex items-start gap-1.5 text-[10px] bg-background/40 rounded-md p-2">
@@ -624,11 +659,17 @@ export default function App() {
                             <div className="flex items-center gap-2">
                               <span className="font-bold text-xs">{t.symbol}</span>
                               <Badge variant={t.ageLabel === 'NEW' ? 'success' : t.ageLabel === 'RECENT' ? 'warning' : 'info'} className="text-[9px] px-1 py-0">{t.ageLabel}</Badge>
+                              <Badge variant={signalBadge(t.signal)} className="text-[9px] px-1 py-0">{t.signal || 'WATCH'}</Badge>
+                              <Badge variant={safetyBadge(t.safety?.riskLevel)} className="text-[9px] px-1 py-0">{t.safety?.riskLevel || 'LOW'}</Badge>
                             </div>
                             <div className="flex items-center gap-2">
                               <div className="text-right">
                                 <span className={cn('text-xs font-bold tabular-nums', pumpScoreColor(t.fundFlow?.pumpScore || 0))}>{t.fundFlow?.pumpScore || 0}</span>
                                 <span className="text-[9px] text-muted-foreground">/100</span>
+                              </div>
+                              <div className="text-right">
+                                <span className={cn('text-xs font-bold tabular-nums', (t.tokenScore || 0) >= 75 ? 'text-emerald-400' : (t.tokenScore || 0) >= 55 ? 'text-amber-400' : 'text-zinc-400')}>{(t.tokenScore || 0).toFixed(0)}</span>
+                                <span className="text-[9px] text-muted-foreground">score</span>
                               </div>
                               <div className="w-12 h-1 rounded-full bg-muted overflow-hidden">
                                 <div className={cn('h-full rounded-full', pumpScoreBg(t.fundFlow?.pumpScore || 0))} style={{ width: `${t.fundFlow?.pumpScore || 0}%` }} />
@@ -687,7 +728,7 @@ export default function App() {
                       <table className="data-table">
                         <thead>
                           <tr>
-                            <th>Token</th><th>Age</th><th>Price</th><th>5m</th><th>1h</th><th>24h</th><th>Vol 24h</th><th>Liq</th><th>Buy Press.</th><th>Flow</th><th>Pump</th><th></th>
+                            <th>Token</th><th>Age</th><th>Price</th><th>5m</th><th>1h</th><th>24h</th><th>Vol 24h</th><th>Liq</th><th>Score</th><th>Signal</th><th>Risk</th><th>Buy Press.</th><th>Flow</th><th>Pump</th><th></th>
                           </tr>
                         </thead>
                         <tbody>
@@ -717,6 +758,19 @@ export default function App() {
                                 </td>
                                 <td className="tabular-nums text-muted-foreground">{formatCompact(t.volume24h || 0)}</td>
                                 <td className="tabular-nums text-muted-foreground">{formatCompact(t.liquidity || 0)}</td>
+                                <td className={cn('tabular-nums font-bold', (t.tokenScore || 0) >= 75 ? 'text-emerald-400' : (t.tokenScore || 0) >= 55 ? 'text-amber-400' : 'text-zinc-400')}>
+                                  {(t.tokenScore || 0).toFixed(0)}
+                                </td>
+                                <td>
+                                  <Badge variant={signalBadge(t.signal)} className="text-[9px] px-1 py-0">
+                                    {t.signal || 'WATCH'}
+                                  </Badge>
+                                </td>
+                                <td>
+                                  <Badge variant={safetyBadge(t.safety?.riskLevel)} className="text-[9px] px-1 py-0">
+                                    {t.safety?.riskLevel || 'LOW'}
+                                  </Badge>
+                                </td>
                                 <td>
                                   <div className="flex items-center gap-1">
                                     <span className={cn('tabular-nums text-xs font-medium', (t.fundFlow?.buyPressure || 50) > 55 ? 'text-emerald-400' : (t.fundFlow?.buyPressure || 50) < 45 ? 'text-red-400' : 'text-zinc-400')}>
@@ -1122,6 +1176,7 @@ export default function App() {
                           {s.direction === 'LONG' ? <TrendingUp className="w-3.5 h-3.5 mr-1" /> : <TrendingDown className="w-3.5 h-3.5 mr-1" />}
                           {s.direction}
                         </Badge>
+                        {s.safety ? <Badge variant={safetyBadge(s.safety.level)} className="text-xs">Safety {String(s.safety.level).toUpperCase()}</Badge> : null}
                         <span className={cn('text-lg font-bold tabular-nums', confColor(s.confidence))}>{s.confidence?.toFixed(0)}%</span>
                       </div>
                       <Button variant="ghost" size="sm" onClick={() => setDetailModal(null)}>
@@ -1180,6 +1235,31 @@ export default function App() {
                         <span className="text-sm font-bold">{s.riskReward?.toFixed(2)}</span>
                       </div>
                     </div>
+
+                    {s.derivatives && (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div className="rounded-lg bg-secondary/40 p-2.5">
+                          <span className="text-[10px] text-muted-foreground block">Funding</span>
+                          <span className={cn('text-sm font-bold', s.derivatives.fundingRate >= 0 ? 'text-amber-400' : 'text-blue-400')}>
+                            {s.derivatives.fundingRate?.toFixed(4)}%
+                          </span>
+                        </div>
+                        <div className="rounded-lg bg-secondary/40 p-2.5">
+                          <span className="text-[10px] text-muted-foreground block">Open Interest</span>
+                          <span className="text-sm font-bold tabular-nums">{(s.derivatives.openInterest || 0).toFixed(0)}</span>
+                        </div>
+                        <div className="rounded-lg bg-secondary/40 p-2.5">
+                          <span className="text-[10px] text-muted-foreground block">L/S Ratio</span>
+                          <span className="text-sm font-bold tabular-nums">{s.derivatives.longShortRatio?.toFixed(2)}</span>
+                        </div>
+                        <div className="rounded-lg bg-secondary/40 p-2.5">
+                          <span className="text-[10px] text-muted-foreground block">Squeeze Risk</span>
+                          <span className={cn('text-sm font-bold uppercase', s.derivatives.squeezeRisk === 'low' ? 'text-zinc-400' : 'text-amber-400')}>
+                            {s.derivatives.squeezeRisk?.replace('_', ' ')}
+                          </span>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Technicals */}
                     {s.technicals && (
@@ -1290,6 +1370,9 @@ export default function App() {
                         <h2 className="text-xl font-bold">{t.symbol}</h2>
                         <span className="text-sm text-muted-foreground">{t.name}</span>
                         <Badge variant={t.ageLabel === 'NEW' ? 'success' : t.ageLabel === 'RECENT' ? 'warning' : 'info'} className="text-xs">{t.ageLabel}</Badge>
+                        <Badge variant={signalBadge(t.signal)} className="text-xs">{t.signal || 'WATCH'}</Badge>
+                        <Badge variant={safetyBadge(t.safety?.riskLevel)} className="text-xs">{t.safety?.riskLevel || 'LOW'}</Badge>
+                        <Badge variant="outline" className="text-xs">Score {(t.tokenScore || 0).toFixed(0)}</Badge>
                       </div>
                       <Button variant="ghost" size="sm" onClick={() => setDetailModal(null)}>
                         <X className="w-4 h-4" />
@@ -1417,6 +1500,47 @@ export default function App() {
                             <div className="flex flex-wrap gap-1">
                               {t.fundFlow.pumpReasons.map((r: string, i: number) => (
                                 <Badge key={i} variant="warning" className="text-[9px]">{r}</Badge>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {t.safety && (
+                      <div className="space-y-2 border-t border-border/40 pt-3">
+                        <h3 className="text-sm font-semibold text-red-400">Safety Layer</h3>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Rug Probability</span>
+                            <span className={cn('text-sm font-bold', (t.safety.rugProbability || 0) >= 65 ? 'text-red-400' : (t.safety.rugProbability || 0) >= 40 ? 'text-amber-400' : 'text-emerald-400')}>
+                              {(t.safety.rugProbability || 0).toFixed(0)}%
+                            </span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Fake Volume</span>
+                            <span className={cn('text-sm font-bold', (t.safety.fakeVolumeProbability || 0) >= 65 ? 'text-red-400' : (t.safety.fakeVolumeProbability || 0) >= 40 ? 'text-amber-400' : 'text-emerald-400')}>
+                              {(t.safety.fakeVolumeProbability || 0).toFixed(0)}%
+                            </span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Dev Concentration</span>
+                            <span className="text-sm font-bold tabular-nums">{(t.safety.devWalletPct || 0).toFixed(0)}%</span>
+                          </div>
+                          <div className="rounded-lg bg-secondary/40 p-2.5">
+                            <span className="text-[10px] text-muted-foreground block">Liquidity Lock</span>
+                            <span className={cn('text-sm font-bold', t.safety.liquidityLocked ? 'text-emerald-400' : 'text-red-400')}>
+                              {t.safety.liquidityLocked ? 'Confirmed' : 'Unclear'}
+                            </span>
+                          </div>
+                        </div>
+
+                        {t.safety.warnings?.length > 0 && (
+                          <div className="rounded-lg border border-red-500/20 bg-red-500/5 p-2.5">
+                            <span className="text-[10px] font-semibold text-red-400 block mb-1">Safety Warnings</span>
+                            <div className="flex flex-wrap gap-1">
+                              {t.safety.warnings.map((w: string, i: number) => (
+                                <Badge key={i} variant="destructive" className="text-[9px]">{w}</Badge>
                               ))}
                             </div>
                           </div>

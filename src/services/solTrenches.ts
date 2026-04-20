@@ -46,12 +46,33 @@ export interface TrenchToken {
   lastUpdated: number;
   fundFlow: FundFlow;
   priceHistory: { price: number; ts: number }[];
+  tokenScore: number;
+  signal: 'EARLY_GEM' | 'WATCH' | 'AVOID';
+  safety: TokenSafety;
+}
+
+export interface TokenSafety {
+  rugProbability: number;
+  fakeVolumeProbability: number;
+  devWalletPct: number;
+  liquidityLocked: boolean;
+  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+  warnings: string[];
 }
 
 export class SolTrenchesService {
   private trackedTokens: Map<string, TrenchToken> = new Map();
   private scanHistory: Map<string, number> = new Map(); // address -> last scan ts
   private priceSnapshots: Map<string, { price: number; ts: number }[]> = new Map();
+  private marketMode: 'RISK_ON' | 'RISK_OFF' = 'RISK_OFF';
+
+  setMarketMode(mode: 'RISK_ON' | 'RISK_OFF') {
+    this.marketMode = mode;
+  }
+
+  getMarketMode(): 'RISK_ON' | 'RISK_OFF' {
+    return this.marketMode;
+  }
 
   // ---- Calculate fund flow from DexScreener pair data ----
   private calculateFundFlow(pair: any): FundFlow {
@@ -208,6 +229,106 @@ export class SolTrenchesService {
   }
 
   // ---- Convert DexScreener pair to TrenchToken ----
+  private calculateTokenSafety(pair: any, ageHours: number): TokenSafety {
+    const warnings: string[] = [];
+    const liquidity = Number(pair.liquidity?.usd || 0);
+    const volume24h = Number(pair.volume?.h24 || 0);
+    const marketCap = Number(pair.marketCap || pair.fdv || 0);
+    const buys = Number(pair.txns?.h24?.buys || 0);
+    const sells = Number(pair.txns?.h24?.sells || 0);
+    const totalTxns = buys + sells;
+
+    const volLiqRatio = liquidity > 0 ? volume24h / liquidity : 0;
+    const buyPressure = totalTxns > 0 ? (buys / totalTxns) * 100 : 50;
+
+    let rugProbability = 0;
+    let fakeVolumeProbability = 0;
+
+    // Heuristic dev wallet proxy: concentrated token with tiny liquidity is riskier.
+    const devWalletPct = Math.min(90, marketCap > 0 ? Math.max(0, ((marketCap - liquidity) / marketCap) * 100) : 50);
+    const liquidityLocked = liquidity >= 75000 || (liquidity >= 40000 && ageHours > 24);
+
+    if (liquidity < 20000) { rugProbability += 30; warnings.push('Very low liquidity'); }
+    else if (liquidity < 50000) { rugProbability += 15; warnings.push('Low liquidity depth'); }
+
+    if (ageHours < 8) { rugProbability += 20; warnings.push('Very new pair'); }
+    else if (ageHours < 24) { rugProbability += 10; }
+
+    if (devWalletPct > 70) { rugProbability += 22; warnings.push('High token concentration'); }
+    else if (devWalletPct > 50) { rugProbability += 12; }
+
+    if (!liquidityLocked) {
+      rugProbability += 12;
+      warnings.push('Liquidity lock not confirmed');
+    }
+
+    if (volLiqRatio > 9) { fakeVolumeProbability += 35; warnings.push('Abnormal volume/liquidity ratio'); }
+    else if (volLiqRatio > 6) { fakeVolumeProbability += 20; }
+
+    if (buyPressure > 92 || buyPressure < 8) {
+      fakeVolumeProbability += 18;
+      warnings.push('Extremely one-sided order flow');
+    }
+
+    if (totalTxns < 40 && volume24h > 150000) {
+      fakeVolumeProbability += 15;
+      warnings.push('Suspiciously high volume with low txn count');
+    }
+
+    if (this.marketMode === 'RISK_OFF') {
+      rugProbability += 5;
+      fakeVolumeProbability += 5;
+    }
+
+    rugProbability = Math.max(0, Math.min(100, rugProbability));
+    fakeVolumeProbability = Math.max(0, Math.min(100, fakeVolumeProbability));
+
+    let riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' = 'LOW';
+    const maxRisk = Math.max(rugProbability, fakeVolumeProbability);
+    if (maxRisk >= 65) riskLevel = 'HIGH';
+    else if (maxRisk >= 40) riskLevel = 'MEDIUM';
+
+    return {
+      rugProbability,
+      fakeVolumeProbability,
+      devWalletPct,
+      liquidityLocked,
+      riskLevel,
+      warnings,
+    };
+  }
+
+  private computeTokenScore(pair: any, fundFlow: FundFlow, safety: TokenSafety): { score: number; signal: 'EARLY_GEM' | 'WATCH' | 'AVOID' } {
+    const volume24h = Number(pair.volume?.h24 || 0);
+    const liquidity = Number(pair.liquidity?.usd || 0);
+    const marketCap = Number(pair.marketCap || pair.fdv || 0);
+    const priceChange1h = Number(pair.priceChange?.h1 || 0);
+
+    const volumeScore = Math.min(25, liquidity > 0 ? (volume24h / liquidity) * 6 : 0);
+    const momentumScore = Math.max(0, Math.min(20, priceChange1h * 1.8));
+    const flowScore = Math.min(25, fundFlow.pumpScore * 0.35);
+    const sizeScore = marketCap > 0 && marketCap < 150000000 ? 15 : marketCap <= 0 ? 0 : 8;
+
+    const riskPenalty = (safety.rugProbability * 0.35) + (safety.fakeVolumeProbability * 0.25);
+    const modeBoost = this.marketMode === 'RISK_ON' ? 6 : -6;
+
+    const score = Math.max(0, Math.min(100, volumeScore + momentumScore + flowScore + sizeScore + modeBoost - riskPenalty));
+
+    const gemThreshold = this.marketMode === 'RISK_ON' ? 72 : 82;
+    const watchThreshold = this.marketMode === 'RISK_ON' ? 52 : 62;
+
+    const signal: 'EARLY_GEM' | 'WATCH' | 'AVOID' =
+      safety.riskLevel === 'HIGH'
+        ? 'AVOID'
+        : score >= gemThreshold
+          ? 'EARLY_GEM'
+          : score >= watchThreshold
+            ? 'WATCH'
+            : 'AVOID';
+
+    return { score, signal };
+  }
+
   private pairToTrenchToken(pair: any, tokenAddress: string): TrenchToken | null {
     if (!pair.baseToken) return null;
 
@@ -225,6 +346,8 @@ export class SolTrenchesService {
 
     // Calculate fund flow
     const fundFlow = this.calculateFundFlow(pair);
+    const safety = this.calculateTokenSafety(pair, ageHours);
+    const scoreMeta = this.computeTokenScore(pair, fundFlow, safety);
 
     // Track price history
     const addr = tokenAddress || pair.baseToken.address || '';
@@ -268,6 +391,9 @@ export class SolTrenchesService {
       lastUpdated: Date.now(),
       fundFlow,
       priceHistory: history.slice(-20), // send last 20 snapshots to frontend
+      tokenScore: scoreMeta.score,
+      signal: scoreMeta.signal,
+      safety,
     };
   }
 
@@ -323,8 +449,13 @@ export class SolTrenchesService {
 
   // ---- Get tokens sorted by pump potential ----
   getPumpCandidates(): TrenchToken[] {
+    const minPump = this.marketMode === 'RISK_ON' ? 20 : 35;
+    const minScore = this.marketMode === 'RISK_ON' ? 60 : 72;
     return this.getTrackedTokens()
-      .filter(t => t.fundFlow.pumpScore > 20)
+      .filter(t => t.fundFlow.pumpScore > minPump)
+      .filter(t => t.signal !== 'AVOID')
+      .filter(t => t.tokenScore >= minScore)
+      .filter(t => t.safety.riskLevel !== 'HIGH')
       .sort((a, b) => b.fundFlow.pumpScore - a.fundFlow.pumpScore);
   }
 

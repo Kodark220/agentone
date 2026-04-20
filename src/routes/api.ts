@@ -180,6 +180,23 @@ export function createRouter(
     res.json({ context: marketContext.getContext() });
   });
 
+  // ---- Dual Engine Views ----
+  router.get('/hunter/opportunities', (_req: Request, res: Response) => {
+    const opportunities = solTrenches.getTrackedTokens()
+      .filter(t => t.signal !== 'AVOID')
+      .sort((a, b) => b.tokenScore - a.tokenScore)
+      .slice(0, 50);
+    res.json({ opportunities, marketMode: marketContext.getContext().marketMode });
+  });
+
+  router.get('/strategist/setups', (_req: Request, res: Response) => {
+    const setups = perpsTrader.getFuturesSetups()
+      .filter(s => !s.safety?.blocked)
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, 50);
+    res.json({ setups, marketMode: marketContext.getContext().marketMode });
+  });
+
   // ---- Futures Trading Setups ----
   router.get('/futures/setups', (_req: Request, res: Response) => {
     const setups = perpsTrader.getFuturesSetups();
