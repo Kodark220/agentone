@@ -1,4 +1,4 @@
-// In production (Vercel), VITE_API_URL points to the backend server (Railway/Render).
+// In production (Vercel), VITE_API_URL points to the backend server.
 // In dev, it falls back to '' so the Vite proxy handles /api requests.
 const BASE = import.meta.env.VITE_API_URL || '';
 const API = `${BASE}/api`;
@@ -18,10 +18,6 @@ export function getSocketUrl(): string {
 
 export const api = {
   getStatus: () => fetchJSON('/status'),
-  analyseToken: (symbol: string, chain = 'any') =>
-    fetchJSON(`/analyse/${encodeURIComponent(symbol)}?chain=${chain}`),
-  searchTokens: (query: string) => fetchJSON(`/search/${encodeURIComponent(query)}`),
-  getTrending: () => fetchJSON('/trending'),
 
   getWatchlist: () => fetchJSON('/watchlist'),
   addToWatchlist: (symbol: string, chain: string, address?: string) =>
@@ -33,43 +29,21 @@ export const api = {
     fetchJSON(`/watchlist/${encodeURIComponent(symbol)}/${chain}`, { method: 'DELETE' }),
 
   getNews: () => fetchJSON('/news'),
-  getSentiment: (symbol: string) => fetchJSON(`/news/sentiment/${encodeURIComponent(symbol)}`),
-
-  getWallets: () => fetchJSON('/wallets'),
-  addWallet: (address: string, label?: string) =>
-    fetchJSON('/wallets', { method: 'POST', body: JSON.stringify({ address, label }) }),
-  removeWallet: (address: string) =>
-    fetchJSON(`/wallets/${encodeURIComponent(address)}`, { method: 'DELETE' }),
-  scanWallets: () => fetchJSON('/wallets/scan'),
-  discoverWhales: () => fetchJSON('/wallets/discover', { method: 'POST' }),
 
   getPositions: () => fetchJSON('/positions'),
   closePosition: (id: string) =>
     fetchJSON(`/positions/close/${encodeURIComponent(id)}`, { method: 'POST' }),
 
-  getSignals: () => fetchJSON('/signals'),
-  runPipeline: () => fetchJSON('/pipeline/run', { method: 'POST' }),
   setAutoTrade: (enabled: boolean) =>
     fetchJSON('/settings/autotrade', {
       method: 'POST',
       body: JSON.stringify({ enabled }),
     }),
-  getMarketContext: () => fetchJSON('/context/market'),
-  getHunterOpportunities: () => fetchJSON('/hunter/opportunities'),
-  getStrategistSetups: () => fetchJSON('/strategist/setups'),
 
-  // Futures setups
+  getMarketContext: () => fetchJSON('/context/market'),
+  getMarkets: () => fetchJSON('/markets'),
+
   getFuturesSetups: () => fetchJSON('/futures/setups'),
   getFuturesSetupDetail: (id: string) => fetchJSON(`/futures/setups/${encodeURIComponent(id)}`),
   generateFuturesSetups: () => fetchJSON('/futures/generate', { method: 'POST' }),
-
-  // Sol trenches
-  getTrenches: () => fetchJSON('/trenches'),
-  getTrenchTokenDetail: (address: string) => fetchJSON(`/trenches/${encodeURIComponent(address)}`),
-  scanTrenches: () => fetchJSON('/trenches/scan', { method: 'POST' }),
-  trackTrenchToken: (address: string) =>
-    fetchJSON('/trenches/track', { method: 'POST', body: JSON.stringify({ address }) }),
-  removeTrenchToken: (address: string) =>
-    fetchJSON(`/trenches/${encodeURIComponent(address)}`, { method: 'DELETE' }),
-  refreshTrenches: () => fetchJSON('/trenches/refresh', { method: 'POST' }),
 };

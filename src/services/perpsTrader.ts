@@ -1316,6 +1316,10 @@ export class PerpsTrader {
     const rewardAmt = Math.abs(tp - entry);
     const riskReward = riskAmt > 0 ? rewardAmt / riskAmt : 0;
 
+    const t1 = tp;
+    const t2 = direction === 'LONG' ? entry + tech.atr * 5 : entry - tech.atr * 5;
+    const t3 = direction === 'LONG' ? entry + tech.atr * 7 : entry - tech.atr * 7;
+
     return {
       id: v4Fallback(),
       symbol,
@@ -1325,6 +1329,7 @@ export class PerpsTrader {
       entry,
       stopLoss: sl,
       takeProfit: tp,
+      targets: { t1, t2, t3 },
       confidence: Math.min(confidence, 100),
       leverage: config.trading.defaultLeverage,
       reason: reasons.join(' | '),
@@ -1363,6 +1368,7 @@ export interface FuturesSetup {
   entry: number;
   stopLoss: number;
   takeProfit: number;
+  targets: { t1: number; t2: number; t3: number };
   confidence: number;
   leverage: number;
   reason: string;

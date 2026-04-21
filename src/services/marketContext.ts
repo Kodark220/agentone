@@ -1,7 +1,6 @@
 import axios from 'axios';
 import { logger } from '../utils/logger';
 import { PerpsTrader } from './perpsTrader';
-import { SolTrenchesService } from './solTrenches';
 
 export type MarketMode = 'RISK_ON' | 'RISK_OFF';
 export type TrendState = 'bullish' | 'bearish' | 'neutral';
@@ -14,6 +13,9 @@ export interface MarketContext {
   btcTrend: TrendState;
   btcDominance: number;
   btcDominanceTrend: DominanceTrend;
+  usdtDominance: number;
+  cyclePhase: string;
+  sectorRotation: string;
   marketMode: MarketMode;
   volatilityState: VolatilityState;
   riskScore: number;
@@ -44,6 +46,9 @@ export class MarketContextCoordinator {
     btcTrend: 'neutral',
     btcDominance: 0,
     btcDominanceTrend: 'flat',
+    usdtDominance: 0,
+    cyclePhase: 'Neutral',
+    sectorRotation: 'Rotating / Unclear',
     marketMode: 'RISK_OFF',
     volatilityState: 'normal',
     riskScore: 50,
@@ -56,7 +61,7 @@ export class MarketContextCoordinator {
 
   private previousDominance = 0;
 
-  async refresh(perpsTrader: PerpsTrader, solTrenches: SolTrenchesService): Promise<MarketContext> {
+  async refresh(perpsTrader: PerpsTrader): Promise<MarketContext> {
     const [btcData, globalData] = await Promise.all([
       this.fetchBTCData(),
       this.fetchGlobalData(),
@@ -69,9 +74,9 @@ export class MarketContextCoordinator {
       ? setups.reduce((sum, s) => sum + (s.confidence || 0), 0) / setups.length
       : 0;
 
-    const flow = solTrenches.getFundFlowSummary();
-    const pumpCandidates = solTrenches.getPumpCandidates().length;
-    const highRiskTokens = solTrenches.getTrackedTokens().filter(t => t.safety?.riskLevel === 'HIGH').length;
+    const flow = { totalNetFlow: 0, accumulating: 0, distributing: 0 };
+    const pumpCandidates = 0;
+    const highRiskTokens = 0;
     const highRiskSetups = setups.filter(s => s.safety?.level === 'high').length;
     const blockedSetups = setups.filter(s => s.safety?.blocked).length;
 
@@ -129,9 +134,11 @@ export class MarketContextCoordinator {
     if (highRiskTokens > Math.max(3, pumpCandidates)) warnings.push('Elevated rug/fake-volume risk in token flow');
     if (blockedSetups > 0) warnings.push(`${blockedSetups} futures setups blocked by safety guard`);
 
-    // Push shared risk mode into both engines.
+    // Push shared risk mode into the futures engine.
     perpsTrader.setMarketMode(marketMode);
-    solTrenches.setMarketMode(marketMode);
+
+    const cyclePhase = this.computeCyclePhase(btcTrend, btcDominanceTrend, globalData.usdtDominance, riskScore);
+    const sectorRotation = this.computeSectorRotation(btcDominanceTrend, btcTrend);
 
     this.context = {
       btcPrice: btcData.price,
@@ -139,6 +146,9 @@ export class MarketContextCoordinator {
       btcTrend,
       btcDominance: globalData.btcDominance,
       btcDominanceTrend,
+      usdtDominance: globalData.usdtDominance,
+      cyclePhase,
+      sectorRotation,
       marketMode,
       volatilityState,
       riskScore,
@@ -189,16 +199,35 @@ export class MarketContextCoordinator {
     }
   }
 
-  private async fetchGlobalData(): Promise<{ btcDominance: number }> {
+  private computeCyclePhase(trend: TrendState, domTrend: DominanceTrend, usdtDom: number, riskScore: number): string {
+    if (trend === 'bearish' && riskScore < 40) return 'Bear / Risk Off';
+    if (trend === 'bullish' && domTrend === 'rising') return 'BTC Season';
+    if (trend === 'bullish' && domTrend === 'falling') return 'Alt Season';
+    if (trend === 'bullish') return 'Early Bull / Accumulation';
+    if (usdtDom > 6) return 'Stablecoin Accumulation';
+    if (riskScore >= 55) return 'Neutral / Cautious Bull';
+    return 'Ranging / Neutral';
+  }
+
+  private computeSectorRotation(domTrend: DominanceTrend, trend: TrendState): string {
+    if (trend === 'bearish') return 'Risk Off → Stables';
+    if (domTrend === 'rising') return 'Alts → BTC';
+    if (domTrend === 'falling') return 'BTC → L1s → Memes';
+    return 'BTC / ETH Consolidation';
+  }
+
+  private async fetchGlobalData(): Promise<{ btcDominance: number; usdtDominance: number }> {
     try {
       const resp = await axios.get('https://api.coingecko.com/api/v3/global', { timeout: 10000 });
       return {
         btcDominance: Number(resp.data?.data?.market_cap_percentage?.btc || 0),
+        usdtDominance: Number(resp.data?.data?.market_cap_percentage?.usdt || 0),
       };
     } catch (err: any) {
       logger.debug(`[MARKET_CONTEXT] Global data fetch failed: ${err.message}`);
       return {
         btcDominance: this.context.btcDominance || 0,
+        usdtDominance: this.context.usdtDominance || 0,
       };
     }
   }
