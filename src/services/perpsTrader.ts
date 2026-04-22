@@ -1289,8 +1289,14 @@ export class PerpsTrader {
     setups.sort((a, b) => b.confidence - a.confidence);
 
     // Professional filter: publish only A-grade setups with solid R:R and no hard block.
+    // Use sliding minPublishConfidence: 2-confluence needs lower score than 3+ confluence
     const filtered = setups
-      .filter(s => s.confidence >= this.thresholds.minPublishConfidence)
+      .filter(s => {
+        const confluenceAdjustedGate = s.confluence >= 3 
+          ? this.thresholds.minPublishConfidence
+          : Math.max(30, this.thresholds.minPublishConfidence - 50);
+        return s.confidence >= confluenceAdjustedGate;
+      })
       .filter(s => s.riskReward >= this.thresholds.minRiskReward)
       .filter(s => !s.safety?.blocked)
       .slice(0, 25);
@@ -1489,12 +1495,12 @@ export class PerpsTrader {
 
     // Momentum confirmation
     if (tech.macdSignal === 'bullish') {
-      longScore += 16;
+      longScore += 20;
       longConfluence++;
       longReasons.push('MACD bullish momentum');
     }
     if (tech.macdSignal === 'bearish') {
-      shortScore += 16;
+      shortScore += 20;
       shortConfluence++;
       shortReasons.push('MACD bearish momentum');
     }
@@ -1538,14 +1544,33 @@ export class PerpsTrader {
     // Penalize obvious counter-structure attempts.
     if (tech.trend === 'uptrend') shortScore -= 14;
     if (tech.trend === 'downtrend') longScore -= 14;
+    // Allow counter-trend if momentum is strong enough
+    if (tech.trend === 'uptrend' && tech.macdSignal === 'bearish') {
+      shortScore += 12;
+      shortConfluence++;
+    }
+    if (tech.trend === 'downtrend' && tech.macdSignal === 'bullish') {
+      longScore += 12;
+      longConfluence++;
+    }
+    if (tech.trend === 'sideways' && tech.macdSignal === 'bearish') {
+      shortScore += 12;
+      shortConfluence++;
+    }
+    if (tech.trend === 'sideways' && tech.macdSignal === 'bullish') {
+      longScore += 12;
+      longConfluence++;
+    }
 
     const direction: 'LONG' | 'SHORT' = longScore >= shortScore ? 'LONG' : 'SHORT';
     const confidence = Math.max(longScore, shortScore);
     const confluence = direction === 'LONG' ? longConfluence : shortConfluence;
     const reasons = direction === 'LONG' ? longReasons : shortReasons;
 
-    // Professional threshold: at least 3 aligned factors and strong raw score.
-    if (confluence < this.thresholds.minConfluence || confidence < this.thresholds.minRawScore) return null;
+    // Professional threshold: at least 2 confluence factors and raw score above 30.
+    const minConfForPublish = Math.max(2, this.thresholds.minConfluence - 1);
+    const minScoreForEval = Math.max(30, this.thresholds.minRawScore - 25);
+    if (confluence < minConfForPublish || confidence < minScoreForEval) return null;
 
     // Calculate SL/TP using ATR
     const atrMultSL = 1.6;
