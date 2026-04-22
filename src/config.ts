@@ -36,5 +36,11 @@ export const config = {
     stopLossPct: parseFloat(process.env.STOP_LOSS_PCT || '5'),
     takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || '15'),
     minSignalConfidence: parseInt(process.env.MIN_SIGNAL_CONFIDENCE || '70'),
+    targetAccuracyPct: parseFloat(process.env.TARGET_ACCURACY_PCT || '80'),
+    setupLookaheadMin: parseInt(process.env.SETUP_LOOKAHEAD_MIN || '180'),
+    minPublishConfidence: parseInt(process.env.MIN_PUBLISH_CONFIDENCE || '80'),
+    minPublishRR: parseFloat(process.env.MIN_PUBLISH_RR || '2'),
+    minConfluence: parseInt(process.env.MIN_CONFLUENCE || '3'),
+    minRawScore: parseInt(process.env.MIN_RAW_SCORE || '55'),
   },
 };

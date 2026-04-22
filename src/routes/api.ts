@@ -28,6 +28,7 @@ export function createRouter(
 
   router.get('/status', async (_req: Request, res: Response) => {
     const balance = await perpsTrader.getBalance();
+    const perf = perpsTrader.getPerformanceStats();
     res.json({
       isRunning: true,
       autoTrade: getAutoTrade(),
@@ -36,7 +37,15 @@ export function createRouter(
       openPositions: perpsTrader.getOpenPositions().length,
       totalPnL: perpsTrader.getTotalPnL(),
       watchlistSize: getWatchlist().length,
+      hitRate20: perf.rolling20.hitRate,
+      hitRate50: perf.rolling50.hitRate,
+      hitRate100: perf.rolling100.hitRate,
+      evaluatedSetups: perf.totalEvaluated,
     });
+  });
+
+  router.get('/performance', (_req: Request, res: Response) => {
+    res.json(perpsTrader.getPerformanceStats());
   });
 
   router.get('/watchlist', (_req: Request, res: Response) => {

@@ -49,6 +49,20 @@ const confBg    = (c: number) => c >= 75 ? 'bg-emerald-500' : c >= 55 ? 'bg-ambe
 const dirVariant = (d: string) => d === 'LONG' ? 'long' : 'short';
 const safetyVariant = (l?: string) => !l || l === 'low' ? 'success' : l === 'medium' ? 'warning' : 'destructive';
 
+type PerformanceSnapshot = {
+  totalEvaluated: number;
+  rolling20?: { sample: number; hitRate: number; avgR: number };
+  rolling50?: { sample: number; hitRate: number; avgR: number };
+  rolling100?: { sample: number; hitRate: number; avgR: number };
+  targetAccuracy?: number;
+  thresholds?: {
+    minPublishConfidence: number;
+    minRiskReward: number;
+    minConfluence: number;
+    minRawScore: number;
+  };
+};
+
 function ConvictionBar({ value }: { value: number }) {
   return (
     <div className="w-full h-1.5 rounded-full bg-muted overflow-hidden">
@@ -75,6 +89,7 @@ export default function App() {
   const [setups,      setSetups]      = useState<any[]>([]);
   const [marketCtx,   setMarketCtx]   = useState<any>(null);
   const [status,      setStatus]      = useState<any>(null);
+  const [performance, setPerformance] = useState<PerformanceSnapshot | null>(null);
   const [autoTrade,   setAutoTrade]   = useState(false);
   const [loading,     setLoading]     = useState(false);
   const [lastUpdate,  setLastUpdate]  = useState(0);
@@ -85,15 +100,17 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const [s, ft, mc] = await Promise.all([
+      const [s, ft, mc, perf] = await Promise.all([
         api.getStatus(),
         api.getFuturesSetups(),
         api.getMarketContext(),
+        api.getPerformance(),
       ]);
       setStatus(s);
       setAutoTrade(s.autoTrade || false);
       setSetups(ft.setups || []);
       setMarketCtx(mc.context || null);
+      setPerformance(perf || null);
       setLastUpdate(Date.now());
     } catch (e) { console.error(e); }
   }, []);
@@ -113,7 +130,12 @@ export default function App() {
 
   const handleGenerate = async () => {
     setLoading(true);
-    try { const r = await api.generateFuturesSetups(); setSetups(r.setups || []); setLastUpdate(Date.now()); }
+    try {
+      const [r, perf] = await Promise.all([api.generateFuturesSetups(), api.getPerformance()]);
+      setSetups(r.setups || []);
+      setPerformance(perf || null);
+      setLastUpdate(Date.now());
+    }
     catch (e) { console.error(e); }
     setLoading(false);
   };
@@ -245,6 +267,58 @@ export default function App() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {performance && (
+          <motion.div {...fadeUp}>
+            <Card className="border-border/40 bg-card/60">
+              <CardContent className="px-4 py-3">
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+                  <div className="rounded-md px-2.5 py-1 border border-blue-500/20 bg-blue-500/8">
+                    <span className="text-[10px] uppercase tracking-widest text-blue-300 font-bold">Model</span>
+                    <div className="text-xs font-black text-blue-400">Performance</div>
+                  </div>
+                  <div className="text-xs tabular-nums">
+                    <span className="text-muted-foreground">Target </span>
+                    <span className="font-bold text-emerald-400">{(performance.targetAccuracy ?? 80).toFixed(0)}%</span>
+                  </div>
+                  <div className="text-xs tabular-nums">
+                    <span className="text-muted-foreground">Evaluated </span>
+                    <span className="font-bold">{performance.totalEvaluated || 0}</span>
+                  </div>
+                  <div className="w-px h-4 bg-border/50" />
+                  <div className="text-xs tabular-nums">
+                    <span className="text-muted-foreground">20 </span>
+                    <span className={cn('font-bold', (performance.rolling20?.hitRate || 0) >= (performance.targetAccuracy || 80) ? 'text-emerald-400' : 'text-amber-400')}>
+                      {(performance.rolling20?.hitRate || 0).toFixed(1)}%
+                    </span>
+                    <span className="text-[10px] text-muted-foreground"> / n={performance.rolling20?.sample || 0}</span>
+                  </div>
+                  <div className="text-xs tabular-nums">
+                    <span className="text-muted-foreground">50 </span>
+                    <span className={cn('font-bold', (performance.rolling50?.hitRate || 0) >= (performance.targetAccuracy || 80) ? 'text-emerald-400' : 'text-amber-400')}>
+                      {(performance.rolling50?.hitRate || 0).toFixed(1)}%
+                    </span>
+                    <span className="text-[10px] text-muted-foreground"> / n={performance.rolling50?.sample || 0}</span>
+                  </div>
+                  <div className="text-xs tabular-nums">
+                    <span className="text-muted-foreground">100 </span>
+                    <span className={cn('font-bold', (performance.rolling100?.hitRate || 0) >= (performance.targetAccuracy || 80) ? 'text-emerald-400' : 'text-amber-400')}>
+                      {(performance.rolling100?.hitRate || 0).toFixed(1)}%
+                    </span>
+                    <span className="text-[10px] text-muted-foreground"> / n={performance.rolling100?.sample || 0}</span>
+                  </div>
+                  <div className="w-px h-4 bg-border/50" />
+                  <div className="text-xs text-muted-foreground">
+                    Gate C<span className="font-semibold text-foreground">{performance.thresholds?.minPublishConfidence ?? 0}</span>
+                    {' '}RR<span className="font-semibold text-foreground">{(performance.thresholds?.minRiskReward ?? 0).toFixed(1)}</span>
+                    {' '}CF<span className="font-semibold text-foreground">{performance.thresholds?.minConfluence ?? 0}</span>
+                    {' '}RS<span className="font-semibold text-foreground">{performance.thresholds?.minRawScore ?? 0}</span>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
 
         {/* Filters */}
         <div className="flex items-center justify-between flex-wrap gap-3">

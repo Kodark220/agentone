@@ -18,6 +18,7 @@ export function getSocketUrl(): string {
 
 export const api = {
   getStatus: () => fetchJSON('/status'),
+  getPerformance: () => fetchJSON('/performance'),
 
   getWatchlist: () => fetchJSON('/watchlist'),
   addToWatchlist: (symbol: string, chain: string, address?: string) =>

@@ -22,6 +22,14 @@ export class PerpsTrader {
   private isInitialized = false;
   private marketMode: RiskMode = 'RISK_OFF';
   private derivativesCache: Map<string, { data: DerivativesIntel; ts: number }> = new Map();
+  private setupOutcomes: SetupOutcome[] = [];
+  private setupLedger: Map<string, FuturesSetup> = new Map();
+  private thresholds = {
+    minPublishConfidence: config.trading.minPublishConfidence,
+    minRiskReward: config.trading.minPublishRR,
+    minConfluence: config.trading.minConfluence,
+    minRawScore: config.trading.minRawScore,
+  };
 
   setMarketMode(mode: RiskMode) {
     this.marketMode = mode;
@@ -837,15 +845,151 @@ export class PerpsTrader {
     return result;
   }
 
+  private registerPublishedSetups(setups: FuturesSetup[]) {
+    for (const s of setups) this.setupLedger.set(s.id, s);
+  }
+
+  private recordSetupOutcome(outcome: SetupOutcome) {
+    this.setupOutcomes.push(outcome);
+    if (this.setupOutcomes.length > 1500) {
+      this.setupOutcomes.splice(0, this.setupOutcomes.length - 1500);
+    }
+  }
+
+  private async evaluateHistoricalOutcomes(): Promise<void> {
+    if (this.setupLedger.size === 0) return;
+
+    const lookaheadMin = config.trading.setupLookaheadMin;
+    const barsToCheck = Math.max(4, Math.floor(lookaheadMin / 15));
+    const now = Date.now();
+    const symbols = [...new Set(Array.from(this.setupLedger.values()).map(s => s.symbol))];
+    const candlesMap = new Map<string, number[][]>();
+
+    await Promise.all(symbols.map(async (sym) => {
+      candlesMap.set(sym, await this.fetchFuturesOHLCV(sym, 220));
+    }));
+
+    for (const [id, setup] of this.setupLedger) {
+      const ageMin = (now - setup.timestamp) / 60000;
+      if (ageMin < lookaheadMin) continue;
+
+      const candles = candlesMap.get(setup.symbol) || [];
+      if (candles.length < 40) continue;
+
+      const startIdx = candles.findIndex(c => Number(c[0]) >= setup.timestamp);
+      if (startIdx < 0) continue;
+
+      const endIdx = Math.min(candles.length - 1, startIdx + barsToCheck);
+      if (endIdx <= startIdx) continue;
+
+      let outcome: 'WIN' | 'LOSS' | 'TIMEOUT' = 'TIMEOUT';
+      let exitPrice = Number(candles[endIdx][4]);
+      let closeTs = Number(candles[endIdx][0]);
+      for (let i = startIdx; i <= endIdx; i++) {
+        const high = Number(candles[i][2]);
+        const low = Number(candles[i][3]);
+        const ts = Number(candles[i][0]);
+
+        if (setup.direction === 'LONG') {
+          const slHit = low <= setup.stopLoss;
+          const tpHit = high >= setup.takeProfit;
+          if (slHit || tpHit) {
+            // Conservative tie-break if both touched in same candle.
+            outcome = slHit ? 'LOSS' : 'WIN';
+            exitPrice = slHit ? setup.stopLoss : setup.takeProfit;
+            closeTs = ts;
+            break;
+          }
+        } else {
+          const slHit = high >= setup.stopLoss;
+          const tpHit = low <= setup.takeProfit;
+          if (slHit || tpHit) {
+            outcome = slHit ? 'LOSS' : 'WIN';
+            exitPrice = slHit ? setup.stopLoss : setup.takeProfit;
+            closeTs = ts;
+            break;
+          }
+        }
+      }
+
+      const risk = Math.max(1e-9, Math.abs(setup.entry - setup.stopLoss));
+      const directionalMove = setup.direction === 'LONG'
+        ? (exitPrice - setup.entry)
+        : (setup.entry - exitPrice);
+      const rMultiple = outcome === 'WIN'
+        ? setup.riskReward
+        : outcome === 'LOSS'
+          ? -1
+          : directionalMove / risk;
+
+      this.recordSetupOutcome({
+        setupId: setup.id,
+        symbol: setup.symbol,
+        direction: setup.direction,
+        confidence: setup.confidence,
+        riskReward: setup.riskReward,
+        outcome,
+        rMultiple: Number(rMultiple.toFixed(3)),
+        openedAt: setup.timestamp,
+        closedAt: closeTs,
+      });
+      this.setupLedger.delete(id);
+    }
+  }
+
+  private buildRollingStats(window: number): RollingStats {
+    const slice = this.setupOutcomes.slice(-window);
+    const decisive = slice.filter(s => s.outcome !== 'TIMEOUT');
+    const wins = decisive.filter(s => s.outcome === 'WIN').length;
+    const losses = decisive.filter(s => s.outcome === 'LOSS').length;
+    const hitRate = decisive.length > 0 ? (wins / decisive.length) * 100 : 0;
+    const avgR = decisive.length > 0 ? decisive.reduce((sum, s) => sum + s.rMultiple, 0) / decisive.length : 0;
+    return {
+      sample: decisive.length,
+      wins,
+      losses,
+      timeouts: slice.length - decisive.length,
+      hitRate: Number(hitRate.toFixed(2)),
+      avgR: Number(avgR.toFixed(3)),
+    };
+  }
+
+  private autoTuneThresholds() {
+    const target = config.trading.targetAccuracyPct;
+    const r50 = this.buildRollingStats(50);
+    if (r50.sample < 20) return;
+
+    if (r50.hitRate < target - 2) {
+      this.thresholds.minPublishConfidence = Math.min(94, this.thresholds.minPublishConfidence + 2);
+      this.thresholds.minRiskReward = Number(Math.min(3, this.thresholds.minRiskReward + 0.1).toFixed(2));
+      this.thresholds.minConfluence = Math.min(5, this.thresholds.minConfluence + 1);
+      this.thresholds.minRawScore = Math.min(72, this.thresholds.minRawScore + 1);
+      logger.info(`[TUNE] Tightened thresholds due to ${r50.hitRate.toFixed(1)}% hit-rate on last ${r50.sample}`);
+      return;
+    }
+
+    if (r50.hitRate > target + 7) {
+      this.thresholds.minPublishConfidence = Math.max(76, this.thresholds.minPublishConfidence - 1);
+      this.thresholds.minRiskReward = Number(Math.max(1.8, this.thresholds.minRiskReward - 0.05).toFixed(2));
+      this.thresholds.minConfluence = Math.max(3, this.thresholds.minConfluence - 1);
+      this.thresholds.minRawScore = Math.max(52, this.thresholds.minRawScore - 1);
+      logger.info(`[TUNE] Relaxed thresholds due to ${r50.hitRate.toFixed(1)}% hit-rate on last ${r50.sample}`);
+    }
+  }
+
   // ---- Compute technicals from OHLCV data ----
   private computeFuturesTechnicals(candles: number[][]): {
     rsi: number;
     macdSignal: 'bullish' | 'bearish' | 'neutral';
     ema20: number;
     ema50: number;
+    ema200: number;
     bollingerPosition: 'upper' | 'middle' | 'lower';
     trend: 'uptrend' | 'downtrend' | 'sideways';
     atr: number;
+    volumeRatio: number;
+    momentum3: number;
+    momentum12: number;
     currentPrice: number;
   } | null {
     if (candles.length < 50) return null;
@@ -873,8 +1017,10 @@ export class PerpsTrader {
     // EMA
     const ema20Values = EMA.calculate({ values: closes, period: 20 });
     const ema50Values = EMA.calculate({ values: closes, period: 50 });
+    const ema200Values = EMA.calculate({ values: closes, period: 200 });
     const ema20 = ema20Values[ema20Values.length - 1] || 0;
     const ema50 = ema50Values[ema50Values.length - 1] || 0;
+    const ema200 = ema200Values[ema200Values.length - 1] || ema50;
 
     // Bollinger Bands
     const bbResult = BollingerBands.calculate({ values: closes, period: 20, stdDev: 2 });
@@ -887,8 +1033,8 @@ export class PerpsTrader {
 
     // Trend
     let trend: 'uptrend' | 'downtrend' | 'sideways' = 'sideways';
-    if (ema20 > ema50 && currentPrice > ema20) trend = 'uptrend';
-    else if (ema20 < ema50 && currentPrice < ema20) trend = 'downtrend';
+    if (ema20 > ema50 && ema50 > ema200 && currentPrice > ema20) trend = 'uptrend';
+    else if (ema20 < ema50 && ema50 < ema200 && currentPrice < ema20) trend = 'downtrend';
 
     // ATR (for SL/TP sizing)
     const atrPeriod = 14;
@@ -903,11 +1049,21 @@ export class PerpsTrader {
     }
     const atr = atrSum / atrPeriod;
 
-    return { rsi, macdSignal, ema20, ema50, bollingerPosition, trend, atr, currentPrice };
+    // Volume expansion: current volume vs 20-candle average.
+    const recentVolume = candles[candles.length - 1][5] || 0;
+    const avgVolume20 = candles.slice(-20).reduce((sum, c) => sum + (c[5] || 0), 0) / 20;
+    const volumeRatio = avgVolume20 > 0 ? recentVolume / avgVolume20 : 1;
+
+    // Short and medium momentum snapshots.
+    const momentum3 = closes.length > 3 ? ((currentPrice - closes[closes.length - 4]) / closes[closes.length - 4]) * 100 : 0;
+    const momentum12 = closes.length > 12 ? ((currentPrice - closes[closes.length - 13]) / closes[closes.length - 13]) * 100 : 0;
+
+    return { rsi, macdSignal, ema20, ema50, ema200, bollingerPosition, trend, atr, volumeRatio, momentum3, momentum12, currentPrice };
   }
 
   // ---- Scan exchange futures markets and generate setups ----
   async scanFuturesMarkets(): Promise<FuturesSetup[]> {
+    await this.evaluateHistoricalOutcomes();
     const setups: FuturesSetup[] = [];
 
     // Get symbols to scan
@@ -1063,9 +1219,19 @@ export class PerpsTrader {
 
     // Re-sort after confidence adjustments
     setups.sort((a, b) => b.confidence - a.confidence);
-    this.futuresSetups = setups;
-    logger.info(`[FUTURES] Generated ${setups.length} setups from exchange perps`);
-    return setups;
+
+    // Professional filter: publish only A-grade setups with solid R:R and no hard block.
+    const filtered = setups
+      .filter(s => s.confidence >= this.thresholds.minPublishConfidence)
+      .filter(s => s.riskReward >= this.thresholds.minRiskReward)
+      .filter(s => !s.safety?.blocked)
+      .slice(0, 25);
+
+    this.futuresSetups = filtered;
+    this.registerPublishedSetups(filtered);
+    this.autoTuneThresholds();
+    logger.info(`[FUTURES] Generated ${filtered.length} high-confidence setups (from ${setups.length} raw candidates)`);
+    return filtered;
   }
 
   // ---- Build a detailed analysis summary for each setup ----
@@ -1234,76 +1400,88 @@ export class PerpsTrader {
     symbol: string,
     tech: NonNullable<ReturnType<PerpsTrader['computeFuturesTechnicals']>>
   ): FuturesSetup | null {
-    let confidence = 0;
-    let direction: 'LONG' | 'SHORT' = 'LONG';
-    const reasons: string[] = [];
+    let longScore = 0;
+    let shortScore = 0;
+    let longConfluence = 0;
+    let shortConfluence = 0;
+    const longReasons: string[] = [];
+    const shortReasons: string[] = [];
 
-    // RSI signals
-    if (tech.rsi < 30) {
-      confidence += 25;
-      direction = 'LONG';
-      reasons.push(`RSI oversold (${tech.rsi.toFixed(1)})`);
-    } else if (tech.rsi > 70) {
-      confidence += 25;
-      direction = 'SHORT';
-      reasons.push(`RSI overbought (${tech.rsi.toFixed(1)})`);
-    } else if (tech.rsi < 40) {
-      confidence += 10;
-      direction = 'LONG';
-      reasons.push(`RSI approaching oversold (${tech.rsi.toFixed(1)})`);
-    } else if (tech.rsi > 60) {
-      confidence += 10;
-      direction = 'SHORT';
-      reasons.push(`RSI approaching overbought (${tech.rsi.toFixed(1)})`);
+    // Trend and structure (highest weight)
+    if (tech.trend === 'uptrend') {
+      longScore += 22;
+      longConfluence++;
+      longReasons.push('Market structure bullish (EMA20 > EMA50 > EMA200)');
+    }
+    if (tech.trend === 'downtrend') {
+      shortScore += 22;
+      shortConfluence++;
+      shortReasons.push('Market structure bearish (EMA20 < EMA50 < EMA200)');
     }
 
-    // MACD
+    // Momentum confirmation
     if (tech.macdSignal === 'bullish') {
-      confidence += 20;
-      if (direction === 'LONG') reasons.push('MACD bullish');
-      else { direction = 'LONG'; reasons.push('MACD bullish crossover'); }
-    } else if (tech.macdSignal === 'bearish') {
-      confidence += 20;
-      if (direction === 'SHORT') reasons.push('MACD bearish');
-      else { direction = 'SHORT'; reasons.push('MACD bearish crossover'); }
+      longScore += 16;
+      longConfluence++;
+      longReasons.push('MACD bullish momentum');
+    }
+    if (tech.macdSignal === 'bearish') {
+      shortScore += 16;
+      shortConfluence++;
+      shortReasons.push('MACD bearish momentum');
     }
 
-    // Trend alignment
-    if (tech.trend === 'uptrend' && direction === 'LONG') {
-      confidence += 15;
-      reasons.push('Uptrend confirmed');
-    } else if (tech.trend === 'downtrend' && direction === 'SHORT') {
-      confidence += 15;
-      reasons.push('Downtrend confirmed');
-    } else if (tech.trend !== 'sideways' && 
-      ((tech.trend === 'uptrend' && direction === 'SHORT') || 
-       (tech.trend === 'downtrend' && direction === 'LONG'))) {
-      confidence -= 10;
-      reasons.push('Counter-trend');
+    // RSI regime and reversal zones
+    if (tech.rsi >= 45 && tech.rsi <= 65) {
+      if (tech.momentum3 > 0 && tech.momentum12 > 0) {
+        longScore += 10;
+        longConfluence++;
+        longReasons.push(`RSI trend regime healthy (${tech.rsi.toFixed(1)})`);
+      }
+      if (tech.momentum3 < 0 && tech.momentum12 < 0) {
+        shortScore += 10;
+        shortConfluence++;
+        shortReasons.push(`RSI trend regime weak (${tech.rsi.toFixed(1)})`);
+      }
+    }
+    if (tech.rsi <= 35 && tech.bollingerPosition === 'lower') {
+      longScore += 14;
+      longConfluence++;
+      longReasons.push(`Oversold mean-reversion pocket (RSI ${tech.rsi.toFixed(1)})`);
+    }
+    if (tech.rsi >= 65 && tech.bollingerPosition === 'upper') {
+      shortScore += 14;
+      shortConfluence++;
+      shortReasons.push(`Overbought fade zone (RSI ${tech.rsi.toFixed(1)})`);
     }
 
-    // Bollinger band extremes
-    if (tech.bollingerPosition === 'lower' && direction === 'LONG') {
-      confidence += 15;
-      reasons.push('At Bollinger lower band');
-    } else if (tech.bollingerPosition === 'upper' && direction === 'SHORT') {
-      confidence += 15;
-      reasons.push('At Bollinger upper band');
+    // Volume confirmation
+    if (tech.volumeRatio >= 1.2 && tech.momentum3 > 0) {
+      longScore += 10;
+      longConfluence++;
+      longReasons.push(`Volume expansion confirms upside (${tech.volumeRatio.toFixed(2)}x)`);
+    }
+    if (tech.volumeRatio >= 1.2 && tech.momentum3 < 0) {
+      shortScore += 10;
+      shortConfluence++;
+      shortReasons.push(`Volume expansion confirms downside (${tech.volumeRatio.toFixed(2)}x)`);
     }
 
-    // EMA proximity (mean reversion)
-    const ema20Dist = Math.abs(tech.currentPrice - tech.ema20) / tech.currentPrice * 100;
-    if (ema20Dist > 3) {
-      confidence += 5;
-      reasons.push(`Price ${ema20Dist.toFixed(1)}% from EMA20`);
-    }
+    // Penalize obvious counter-structure attempts.
+    if (tech.trend === 'uptrend') shortScore -= 14;
+    if (tech.trend === 'downtrend') longScore -= 14;
 
-    // Minimum threshold — only show actionable setups
-    if (confidence < 30) return null;
+    const direction: 'LONG' | 'SHORT' = longScore >= shortScore ? 'LONG' : 'SHORT';
+    const confidence = Math.max(longScore, shortScore);
+    const confluence = direction === 'LONG' ? longConfluence : shortConfluence;
+    const reasons = direction === 'LONG' ? longReasons : shortReasons;
+
+    // Professional threshold: at least 3 aligned factors and strong raw score.
+    if (confluence < this.thresholds.minConfluence || confidence < this.thresholds.minRawScore) return null;
 
     // Calculate SL/TP using ATR
-    const atrMultSL = 1.5;
-    const atrMultTP = 3.0;
+    const atrMultSL = 1.6;
+    const atrMultTP = 3.6;
     const entry = tech.currentPrice;
     const sl = direction === 'LONG'
       ? entry - tech.atr * atrMultSL
@@ -1330,7 +1508,7 @@ export class PerpsTrader {
       stopLoss: sl,
       takeProfit: tp,
       targets: { t1, t2, t3 },
-      confidence: Math.min(confidence, 100),
+      confidence: Math.min(Math.max(confidence, 0), 100),
       leverage: config.trading.defaultLeverage,
       reason: reasons.join(' | '),
       riskReward,
@@ -1350,6 +1528,18 @@ export class PerpsTrader {
 
   getFuturesSetups(): FuturesSetup[] {
     return this.futuresSetups;
+  }
+
+  getPerformanceStats(): PerformanceStats {
+    return {
+      totalEvaluated: this.setupOutcomes.length,
+      rolling20: this.buildRollingStats(20),
+      rolling50: this.buildRollingStats(50),
+      rolling100: this.buildRollingStats(100),
+      targetAccuracy: config.trading.targetAccuracyPct,
+      thresholds: { ...this.thresholds },
+      recentOutcomes: this.setupOutcomes.slice(-20).reverse(),
+    };
   }
 
   // ---- Get detailed data for a single futures setup ----
@@ -1413,4 +1603,40 @@ export interface SetupSafety {
   level: 'low' | 'medium' | 'high';
   blocked: boolean;
   warnings: string[];
+}
+
+export interface SetupOutcome {
+  setupId: string;
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  confidence: number;
+  riskReward: number;
+  outcome: 'WIN' | 'LOSS' | 'TIMEOUT';
+  rMultiple: number;
+  openedAt: number;
+  closedAt: number;
+}
+
+export interface RollingStats {
+  sample: number;
+  wins: number;
+  losses: number;
+  timeouts: number;
+  hitRate: number;
+  avgR: number;
+}
+
+export interface PerformanceStats {
+  totalEvaluated: number;
+  rolling20: RollingStats;
+  rolling50: RollingStats;
+  rolling100: RollingStats;
+  targetAccuracy: number;
+  thresholds: {
+    minPublishConfidence: number;
+    minRiskReward: number;
+    minConfluence: number;
+    minRawScore: number;
+  };
+  recentOutcomes: SetupOutcome[];
 }
