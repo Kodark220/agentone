@@ -33,6 +33,8 @@ export function createRouter(
       isRunning: true,
       autoTrade: getAutoTrade(),
       exchangeConnected: perpsTrader.isReady(),
+      activeExchange: perpsTrader.getActiveExchangeLabel(),
+      tradingEnabled: perpsTrader.canTrade(),
       balance,
       openPositions: perpsTrader.getOpenPositions().length,
       totalPnL: perpsTrader.getTotalPnL(),

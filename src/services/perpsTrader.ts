@@ -18,6 +18,7 @@ type RiskMode = 'RISK_ON' | 'RISK_OFF';
 
 export class PerpsTrader {
   private exchange: Exchange | null = null;
+  private activeExchangeId: string | null = null;
   private positions: Map<string, Position> = new Map();
   private isInitialized = false;
   private marketMode: RiskMode = 'RISK_OFF';
@@ -39,42 +40,105 @@ export class PerpsTrader {
     return this.marketMode;
   }
 
-  // ---- Initialize exchange connection ----
-  async initialize(): Promise<boolean> {
-    try {
-      const ExchangeClass = (ccxt as any)[config.exchange.id];
-      if (!ExchangeClass) {
-        logger.error(`Exchange '${config.exchange.id}' not supported by CCXT`);
-        return false;
-      }
+  private getConfiguredExchangeClassId(): string {
+    if (config.exchange.id === 'binance') return 'binanceusdm';
+    return config.exchange.id;
+  }
 
-      this.exchange = new ExchangeClass({
-        apiKey: config.exchange.apiKey,
-        secret: config.exchange.secret,
-        password: config.exchange.password || undefined,
-        options: {
-          defaultType: 'future',
-          adjustForTimeDifference: true,
-        },
-      });
+  private getExchangeCandidates(): string[] {
+    return [...new Set([this.getConfiguredExchangeClassId(), 'gateio'])];
+  }
 
-      if (config.exchange.sandbox) {
-        this.exchange!.setSandboxMode(true);
-        logger.info('Exchange running in SANDBOX mode');
-      }
+  private getExchangeLabel(exchangeId: string): string {
+    switch (exchangeId) {
+      case 'binanceusdm':
+        return 'Binance Futures';
+      case 'gateio':
+        return 'Gate.io';
+      case 'okx':
+        return 'OKX';
+      default:
+        return exchangeId;
+    }
+  }
 
-      // Test connection
-      await this.exchange!.loadMarkets();
-      const balance: any = await this.exchange!.fetchBalance();
-      const totalUSDT = balance.total?.USDT || balance.total?.USD || 0;
-      logger.info(`Exchange connected: ${config.exchange.id} | Balance: $${totalUSDT}`);
+  getActiveExchangeLabel(): string {
+    return this.getExchangeLabel(this.activeExchangeId || this.getConfiguredExchangeClassId());
+  }
 
-      this.isInitialized = true;
-      return true;
-    } catch (err: any) {
-      logger.error(`Exchange init failed: ${err.message}`);
+  private hasPrivateApiAccess(): boolean {
+    return Boolean((this.exchange as any)?.apiKey);
+  }
+
+  canTrade(): boolean {
+    return this.isReady() && this.hasPrivateApiAccess();
+  }
+
+  private shouldEnableSandbox(exchangeId: string): boolean {
+    if (!config.exchange.sandbox) return false;
+    if (exchangeId !== this.getConfiguredExchangeClassId()) return false;
+
+    if (exchangeId === 'binance' || exchangeId === 'binanceusdm') {
+      logger.warn('Binance futures sandbox is deprecated in CCXT; continuing with live public endpoints and disabling sandbox mode');
       return false;
     }
+
+    return true;
+  }
+
+  private createExchange(exchangeId: string, useCredentials: boolean): Exchange {
+    const ExchangeClass = (ccxt as any)[exchangeId];
+    return new ExchangeClass({
+      apiKey: useCredentials ? config.exchange.apiKey : undefined,
+      secret: useCredentials ? config.exchange.secret : undefined,
+      password: useCredentials ? (config.exchange.password || undefined) : undefined,
+      options: {
+        defaultType: 'future',
+        adjustForTimeDifference: true,
+        fetchCurrencies: false,
+      },
+    });
+  }
+
+  // ---- Initialize exchange connection ----
+  async initialize(): Promise<boolean> {
+    let lastError = 'unknown error';
+
+    for (const exchangeId of this.getExchangeCandidates()) {
+      try {
+        const useCredentials = exchangeId === this.getConfiguredExchangeClassId();
+      const ExchangeClass = (ccxt as any)[exchangeId];
+      if (!ExchangeClass) {
+        logger.error(`Exchange '${exchangeId}' not supported by CCXT`);
+        continue;
+      }
+
+        this.exchange = this.createExchange(exchangeId, useCredentials);
+
+        if (this.shouldEnableSandbox(exchangeId)) {
+          this.exchange!.setSandboxMode(true);
+          logger.info(`Exchange running in SANDBOX mode (${this.getExchangeLabel(exchangeId)})`);
+        }
+
+        await this.exchange!.loadMarkets();
+
+        this.isInitialized = true;
+        this.activeExchangeId = exchangeId;
+
+        logger.info(`Exchange public market data connected: ${this.getExchangeLabel(exchangeId)}${useCredentials ? '' : ' (fallback)'}`);
+
+        return true;
+      } catch (err: any) {
+        lastError = err.message;
+        logger.warn(`[INIT] ${this.getExchangeLabel(exchangeId)} unavailable: ${err.message}`);
+      }
+    }
+
+    this.exchange = null;
+    this.activeExchangeId = null;
+    this.isInitialized = false;
+    logger.error(`Exchange init failed: ${lastError}`);
+    return false;
   }
 
   isReady(): boolean {
@@ -83,7 +147,7 @@ export class PerpsTrader {
 
   // ---- Get account balance ----
   async getBalance(): Promise<{ total: number; free: number; used: number }> {
-    if (!this.exchange) return { total: 0, free: 0, used: 0 };
+    if (!this.exchange || !this.hasPrivateApiAccess()) return { total: 0, free: 0, used: 0 };
     try {
       const balance: any = await this.exchange.fetchBalance();
       return {
@@ -99,7 +163,7 @@ export class PerpsTrader {
 
   // ---- Set leverage for a symbol ----
   async setLeverage(symbol: string, leverage: number): Promise<boolean> {
-    if (!this.exchange) return false;
+    if (!this.exchange || !this.canTrade()) return false;
     try {
       await this.exchange.setLeverage(leverage, symbol);
       logger.info(`Leverage set to ${leverage}x for ${symbol}`);
@@ -114,6 +178,10 @@ export class PerpsTrader {
   async openPosition(signal: AggregatedSignal): Promise<Position | null> {
     if (!this.exchange) {
       logger.error('Exchange not initialized');
+      return null;
+    }
+    if (!this.canTrade()) {
+      logger.warn(`Trading unavailable on current exchange connection (${this.getActiveExchangeLabel()})`);
       return null;
     }
 
@@ -216,7 +284,7 @@ export class PerpsTrader {
 
   // ---- Close a position ----
   async closePosition(positionId: string): Promise<boolean> {
-    if (!this.exchange) return false;
+    if (!this.exchange || !this.canTrade()) return false;
 
     const position = this.positions.get(positionId);
     if (!position || position.status === 'closed') return false;
@@ -1502,7 +1570,7 @@ export class PerpsTrader {
       id: v4Fallback(),
       symbol,
       pair: `${symbol}/USDT`,
-      exchange: this.isInitialized ? config.exchange.id : 'Gate.io',
+      exchange: this.isInitialized ? this.getActiveExchangeLabel() : 'Gate.io',
       direction,
       entry,
       stopLoss: sl,

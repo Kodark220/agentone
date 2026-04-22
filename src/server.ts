@@ -106,6 +106,8 @@ async function main() {
       uptime: process.uptime(),
       env: config.nodeEnv,
       exchangeConnected: perpsTrader.isReady(),
+      activeExchange: perpsTrader.getActiveExchangeLabel(),
+      tradingEnabled: perpsTrader.canTrade(),
       timestamp: new Date().toISOString(),
     });
   });
@@ -171,7 +173,7 @@ async function main() {
   server.listen(config.port, () => {
     logger.info(`Server running on http://localhost:${config.port}`);
     logger.info(`API: http://localhost:${config.port}/api/status`);
-    logger.info(`Env: ${config.nodeEnv} | Exchange: ${config.exchange.id} | Sandbox: ${config.exchange.sandbox}`);
+    logger.info(`Env: ${config.nodeEnv} | Configured Exchange: ${config.exchange.id} | Active Exchange: ${perpsTrader.getActiveExchangeLabel()} | Sandbox: ${config.exchange.sandbox}`);
   });
 
   try {
