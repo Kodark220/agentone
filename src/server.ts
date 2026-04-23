@@ -45,15 +45,16 @@ async function main() {
   let autoTrade = false;
   let watchlist: WatchlistItem[] = [];
 
-  if (config.exchange.apiKey) {
-    const connected = await perpsTrader.initialize();
-    if (connected) {
+  const connected = await perpsTrader.initialize();
+  if (connected) {
+    if (config.exchange.apiKey) {
       logger.info('Exchange connected successfully');
     } else {
-      logger.warn('Exchange connection failed - trading disabled');
+      logger.info('Exchange public market data connected (analysis-only mode)');
+      logger.warn('No exchange API key set - trading disabled');
     }
   } else {
-    logger.warn('No exchange API key set - running in analysis-only mode');
+    logger.warn('Exchange connection failed - trading disabled');
   }
 
   const app = express();
