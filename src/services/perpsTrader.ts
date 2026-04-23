@@ -1597,6 +1597,7 @@ export class PerpsTrader {
       pair: `${symbol}/USDT`,
       exchange: this.isInitialized ? this.getActiveExchangeLabel() : 'Gate.io',
       direction,
+      confluence,
       entry,
       stopLoss: sl,
       takeProfit: tp,
@@ -1648,6 +1649,7 @@ export interface FuturesSetup {
   pair: string;
   exchange: string;
   direction: 'LONG' | 'SHORT';
+  confluence: number;
   entry: number;
   stopLoss: number;
   takeProfit: number;
